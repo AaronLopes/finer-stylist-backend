@@ -67,6 +67,10 @@ class OutfitParams:
     hero_boost: float = 1.0  # 1.5 for "serve-looks"
     color_strategy: ColorStrategy = ColorStrategy.BALANCED
 
+    # Affiliate boosting
+    boost_affiliates: bool = True  # Default to boosting affiliates
+    affiliate_boost_weight: float = 0.15  # How much to boost (0-1)
+
 
 @dataclass
 class SlotConfig:
@@ -136,11 +140,12 @@ OCCASION_FORMULAS: Dict[str, OutfitFormula] = {
 }
 
 # Setting → Tag modifiers
+# NOTE: Avoid "casual" - 72% of products have it, making it meaningless noise
 SETTING_TAG_MAP: Dict[str, List[str]] = {
-    "city": ["urban", "polished", "structured", "smart_casual"],
-    "country": ["relaxed", "earth_tones", "casual", "bohemian"],
-    "suburbs": ["casual", "relaxed", "comfortable"],
-    "beach": ["summer", "relaxed", "bright", "linen", "casual"],
+    "city": ["urban", "polished", "structured", "smart_casual", "streetwear"],
+    "country": ["relaxed", "earth_tones", "bohemian"],
+    "suburbs": ["relaxed", "everyday", "classic"],
+    "beach": ["summer", "relaxed", "bright", "linen"],
     "night-out": ["dark", "going_out", "fitted", "dressy"],
 }
 
@@ -164,12 +169,21 @@ WEATHER_TAG_MAP: Dict[str, Dict[str, List[str]]] = {
 }
 
 # Style → Core tags
+# NOTE: Avoid "casual" - 72% of products have it, making it meaningless noise
 STYLE_TAG_MAP: Dict[str, List[str]] = {
     "minimalist": ["minimalist", "solid", "neutral", "classic"],
     "bohemian": ["bohemian", "floral", "earth_tones", "relaxed"],
     "fitted": ["fitted", "slim", "structured"],
     "smart-casual": ["smart_casual", "classic", "polished"],
     "classic": ["classic", "neutral", "solid"],
+    "streetwear": ["streetwear", "fitted", "dark"],
+}
+
+# Occasion-specific tag overrides (these REPLACE style tags for specific occasions)
+# NOTE: Avoid "casual" - 72% of products have it, making it meaningless noise
+OCCASION_STYLE_OVERRIDE: Dict[str, List[str]] = {
+    "gym": ["gym", "activewear", "athletic", "workout"],
+    "beach": ["swimwear", "summer", "linen", "bright"],
 }
 
 # Goals → Strategy modifiers
@@ -177,27 +191,37 @@ GOALS_STRATEGY: Dict[str, Dict[str, Any]] = {
     "serve-looks": {
         "hero_boost": 1.5,
         "color_strategy": ColorStrategy.BOLD,
+        "boost_affiliates": True,
+        "affiliate_boost_weight": 0.08,
     },
     "inspired": {
         "hero_boost": 1.0,
         "color_strategy": ColorStrategy.BALANCED,
+        "boost_affiliates": True,
+        "affiliate_boost_weight": 0.08,
     },
     "discover-brands": {
         "hero_boost": 1.0,
         "color_strategy": ColorStrategy.BALANCED,
+        "boost_affiliates": True,
+        "affiliate_boost_weight": 0.15,  # Moderate affiliate boost for brand discovery
     },
     "capsule": {
         "hero_boost": 0.8,
         "color_strategy": ColorStrategy.NEUTRAL,
+        "boost_affiliates": True,
+        "affiliate_boost_weight": 0.05,
     },
 }
 
 # Budget → Price ranges
+# NOTE: These are per-item ranges, not total outfit
+# Ranges overlap to ensure we find products at budget boundaries
 BUDGET_RANGES: Dict[str, Dict[str, float]] = {
-    "$": {"min": 0, "max": 100},
-    "$$": {"min": 100, "max": 300},
-    "$$$": {"min": 300, "max": 500},
-    "$$$$": {"min": 500, "max": 10000},
+    "$": {"min": 0, "max": 75},
+    "$$": {"min": 0, "max": 150},  # Overlaps with $ to catch more
+    "$$$": {"min": 0, "max": 300},  # No min - include affordable activewear etc
+    "$$$$": {"min": 0, "max": 10000},  # Luxury - no limits
 }
 
 
@@ -252,16 +276,25 @@ class OutfitBuilder:
     def _quiz_to_params(self, quiz: Dict[str, Any]) -> OutfitParams:
         """Convert quiz answers to OutfitParams."""
 
-        # Collect style tags
-        style_tags = []
-        style = quiz.get("style")
-        if style and style in STYLE_TAG_MAP:
-            style_tags.extend(STYLE_TAG_MAP[style])
+        occasion = quiz.get("occasion", "casual")
 
-        # Add setting tags
-        setting = quiz.get("setting")
-        if setting and setting in SETTING_TAG_MAP:
-            style_tags.extend(SETTING_TAG_MAP[setting])
+        # Check if this occasion has a style override (gym, beach, etc.)
+        # If so, use occasion-specific tags instead of generic style/setting tags
+        if occasion in OCCASION_STYLE_OVERRIDE:
+            # For gym/beach: use specific activewear/swimwear tags
+            style_tags = OCCASION_STYLE_OVERRIDE[occasion].copy()
+            logger.info("Using occasion override tags for %s: %s", occasion, style_tags)
+        else:
+            # Normal flow: collect style tags from quiz
+            style_tags = []
+            style = quiz.get("style")
+            if style and style in STYLE_TAG_MAP:
+                style_tags.extend(STYLE_TAG_MAP[style])
+
+            # Add setting tags
+            setting = quiz.get("setting")
+            if setting and setting in SETTING_TAG_MAP:
+                style_tags.extend(SETTING_TAG_MAP[setting])
 
         # Collect season/weather tags
         season_tags = []
@@ -277,7 +310,6 @@ class OutfitBuilder:
                 avoid_tags.extend(weather_config.get("avoid_tags", []))
 
         # Occasion tags
-        occasion = quiz.get("occasion", "casual")
         occasion_tags = [occasion.replace("-", "_")]
 
         # Budget
@@ -291,12 +323,20 @@ class OutfitBuilder:
 
         hero_boost = 1.0
         color_strategy = ColorStrategy.BALANCED
+        boost_affiliates = True
+        affiliate_boost_weight = 0.15  # Default boost
+
         for goal in goals:
             if goal in GOALS_STRATEGY:
                 strategy = GOALS_STRATEGY[goal]
                 hero_boost = max(hero_boost, strategy.get("hero_boost", 1.0))
                 if strategy.get("color_strategy"):
                     color_strategy = strategy["color_strategy"]
+                # Use highest affiliate boost if multiple goals
+                if strategy.get("affiliate_boost_weight", 0) > affiliate_boost_weight:
+                    affiliate_boost_weight = strategy["affiliate_boost_weight"]
+                if "boost_affiliates" in strategy:
+                    boost_affiliates = strategy["boost_affiliates"]
 
         return OutfitParams(
             gender=quiz.get("gender", "unisex"),
@@ -309,6 +349,8 @@ class OutfitBuilder:
             avoid_tags=list(set(avoid_tags)),
             hero_boost=hero_boost,
             color_strategy=color_strategy,
+            boost_affiliates=boost_affiliates,
+            affiliate_boost_weight=affiliate_boost_weight,
         )
 
     # =========================================================================
@@ -521,10 +563,10 @@ Only include fields you can confidently extract. Be concise."""
                 slot_config.is_hero,
             )
 
-            # Query ff_build_outfit_v2 for this slot
+            # Query ff_build_outfit_v3 for this slot (with affiliate boosting)
             try:
                 result = self.supabase.rpc(
-                    "ff_build_outfit_v2",
+                    "ff_build_outfit_v3",
                     {
                         "p_slot": slot_config.slot,
                         "p_gender": params.gender,
@@ -539,6 +581,8 @@ Only include fields you can confidently extract. Be concise."""
                         "p_existing_colors": selected_colors,
                         "p_existing_textures": selected_textures,
                         "p_color_strategy": params.color_strategy.value,
+                        "p_boost_affiliates": params.boost_affiliates,
+                        "p_affiliate_boost_weight": params.affiliate_boost_weight,
                         "p_n": 1,  # Get top candidate
                     },
                 ).execute()
@@ -626,7 +670,7 @@ Only include fields you can confidently extract. Be concise."""
         # Query for alternatives
         try:
             result = self.supabase.rpc(
-                "ff_build_outfit_v2",
+                "ff_build_outfit_v3",
                 {
                     "p_slot": slot_to_swap,
                     "p_gender": params_used.get("gender", "unisex"),
@@ -637,6 +681,10 @@ Only include fields you can confidently extract. Be concise."""
                     "p_existing_colors": existing_colors,
                     "p_existing_textures": existing_textures,
                     "p_color_strategy": params_used.get("color_strategy", "balanced"),
+                    "p_boost_affiliates": params_used.get("boost_affiliates", True),
+                    "p_affiliate_boost_weight": params_used.get(
+                        "affiliate_boost_weight", 0.15
+                    ),
                     "p_n": 5,  # Get multiple to filter
                 },
             ).execute()
