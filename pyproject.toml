@@ -1,0 +1,6 @@
+[tool.pylint.messages_control]
+disable = [
+    "global-statement",
+    "broad-exception-caught",
+    "import-error",
+]
