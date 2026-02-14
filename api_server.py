@@ -65,6 +65,101 @@ def get_fit_image_service() -> FitImageService:
     return _fit_image_service
 
 
+def _short_user_id(user_id: Optional[str]) -> str:
+    if not user_id:
+        return "missing"
+    if len(user_id) <= 8:
+        return user_id
+    return f"{user_id[:4]}...{user_id[-4:]}"
+
+
+def _is_missing_profile_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    if isinstance(value, (list, dict)):
+        return len(value) == 0
+    return False
+
+
+def _is_sparse_profile(profile: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(profile, dict) or not profile:
+        return True
+
+    core_keys = ["gender", "occasion", "style", "budget", "weather", "setting", "goals"]
+    populated_count = 0
+
+    for key in core_keys:
+        if not _is_missing_profile_value(profile.get(key)):
+            populated_count += 1
+
+    return populated_count < 2
+
+
+def _merge_profile_with_fallback(
+    user_profile: Optional[Dict[str, Any]], fallback_profile: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    merged: Dict[str, Any] = dict(user_profile or {})
+    fallback = fallback_profile or {}
+
+    for key, value in fallback.items():
+        if key not in merged or _is_missing_profile_value(merged.get(key)):
+            merged[key] = value
+
+    return merged
+
+
+def _fetch_latest_quiz_profile(user_id: str) -> Dict[str, Any]:
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_KEY")
+
+    if not supabase_url or not supabase_key:
+        logger.warning(
+            "/outfit/build chat profile hydration skipped: missing Supabase env vars"
+        )
+        return {}
+
+    try:
+        from supabase import create_client
+
+        client = create_client(supabase_url, supabase_key)
+        response = (
+            client.table("user_profile")
+            .select("quiz_answers,updated_at")
+            .eq("user_id", user_id)
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        rows = response.data or []
+        if not rows:
+            logger.info(
+                "/outfit/build chat profile hydration no quiz profile found user=%s",
+                _short_user_id(user_id),
+            )
+            return {}
+
+        quiz_answers = rows[0].get("quiz_answers")
+        if not isinstance(quiz_answers, dict):
+            logger.warning(
+                "/outfit/build chat profile hydration invalid quiz_answers type user=%s type=%s",
+                _short_user_id(user_id),
+                type(quiz_answers).__name__,
+            )
+            return {}
+
+        return quiz_answers
+    except Exception as exc:
+        logger.exception(
+            "/outfit/build chat profile hydration failed user=%s error=%s",
+            _short_user_id(user_id),
+            exc,
+        )
+        return {}
+
+
 # =============================================================================
 # VALIDATION HELPERS
 # =============================================================================
@@ -168,11 +263,16 @@ def build_outfit():
     data = request.get_json()
 
     if not data:
+        logger.warning("/outfit/build missing JSON payload")
         return jsonify({"success": False, "error": "No JSON payload provided"}), 400
 
     mode = data.get("mode")
+    logger.info(
+        "/outfit/build request received mode=%s keys=%s", mode, list(data.keys())
+    )
 
     if mode not in ["quiz", "chat"]:
+        logger.warning("/outfit/build invalid mode=%s", mode)
         return (
             jsonify(
                 {
@@ -189,6 +289,7 @@ def build_outfit():
         if mode == "quiz":
             quiz_answers = data.get("quiz_answers")
             if not quiz_answers:
+                logger.warning("/outfit/build quiz mode missing quiz_answers")
                 return (
                     jsonify(
                         {
@@ -201,6 +302,7 @@ def build_outfit():
 
             valid, error = validate_quiz_answers(quiz_answers)
             if not valid:
+                logger.warning("/outfit/build quiz validation failed: %s", error)
                 return jsonify({"success": False, "error": error}), 400
 
             outfit = builder.build_from_quiz(quiz_answers)
@@ -208,6 +310,7 @@ def build_outfit():
         else:  # chat mode
             chat_query = data.get("chat_query")
             if not chat_query:
+                logger.warning("/outfit/build chat mode missing chat_query")
                 return (
                     jsonify(
                         {"success": False, "error": "chat_query required for chat mode"}
@@ -217,11 +320,92 @@ def build_outfit():
 
             valid, error = validate_chat_query(chat_query)
             if not valid:
+                logger.warning("/outfit/build chat validation failed: %s", error)
                 return jsonify({"success": False, "error": error}), 400
 
+            query_text = chat_query.get("query") or ""
+            user_profile = chat_query.get("user_profile") or {}
+            chat_user_id = chat_query.get("user_id")
+
+            if _is_sparse_profile(user_profile):
+                if chat_user_id:
+                    fallback_profile = _fetch_latest_quiz_profile(chat_user_id)
+                    if fallback_profile:
+                        user_profile = _merge_profile_with_fallback(
+                            user_profile, fallback_profile
+                        )
+                        logger.info(
+                            "/outfit/build chat profile hydrated user=%s fallback_keys=%s merged_keys=%s",
+                            _short_user_id(chat_user_id),
+                            list(fallback_profile.keys()),
+                            list(user_profile.keys()),
+                        )
+                    else:
+                        logger.info(
+                            "/outfit/build chat profile sparse user=%s no fallback data",
+                            _short_user_id(chat_user_id),
+                        )
+                else:
+                    logger.info(
+                        "/outfit/build chat profile sparse without user_id, cannot hydrate"
+                    )
+
+            logger.info(
+                "/outfit/build chat query_len=%s profile_keys=%s",
+                len(query_text),
+                list(user_profile.keys()) if isinstance(user_profile, dict) else [],
+            )
+
             outfit = builder.build_from_chat(
-                query=chat_query.get("query"),
-                user_profile=chat_query.get("user_profile"),
+                query=query_text,
+                user_profile=user_profile,
+            )
+
+            if not (outfit.get("items") or {}):
+                logger.warning(
+                    "/outfit/build chat empty result; attempting quiz fallback user=%s",
+                    _short_user_id(chat_user_id),
+                )
+
+                quiz_fallback_payload = {
+                    "gender": (user_profile or {}).get("gender"),
+                    "occasion": (user_profile or {}).get("occasion"),
+                    "style": (user_profile or {}).get("style"),
+                    "budget": (user_profile or {}).get("budget"),
+                    "weather": (user_profile or {}).get("weather"),
+                    "setting": (user_profile or {}).get("setting"),
+                    "goals": (user_profile or {}).get("goals"),
+                }
+
+                valid_quiz_fallback, quiz_fallback_error = validate_quiz_answers(
+                    quiz_fallback_payload
+                )
+
+                if valid_quiz_fallback:
+                    fallback_outfit = builder.build_from_quiz(quiz_fallback_payload)
+                    if fallback_outfit.get("items"):
+                        outfit = fallback_outfit
+                        logger.info(
+                            "/outfit/build chat fallback success user=%s item_slots=%s",
+                            _short_user_id(chat_user_id),
+                            list((outfit.get("items") or {}).keys()),
+                        )
+                    else:
+                        logger.warning(
+                            "/outfit/build chat fallback returned empty items user=%s",
+                            _short_user_id(chat_user_id),
+                        )
+                else:
+                    logger.warning(
+                        "/outfit/build chat fallback skipped user=%s reason=%s",
+                        _short_user_id(chat_user_id),
+                        quiz_fallback_error,
+                    )
+
+            logger.info(
+                "/outfit/build chat success item_slots=%s total_price=%s",
+                list((outfit.get("items") or {}).keys()),
+                outfit.get("total_price", 0.0),
             )
 
         return jsonify(
@@ -234,7 +418,7 @@ def build_outfit():
         )
 
     except Exception as e:
-        logger.error("Outfit build failed: %s", e)
+        logger.exception("Outfit build failed mode=%s error=%s", mode, e)
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -249,6 +433,7 @@ def swap_outfit_item():
     data = request.get_json()
 
     if not data:
+        logger.warning("/outfit/swap missing JSON payload")
         return jsonify({"success": False, "error": "No JSON payload provided"}), 400
 
     valid, error = validate_swap_request(data)
@@ -296,7 +481,18 @@ def parse_chat_query():
     data = request.get_json()
 
     if not data:
+        logger.warning("/chat/parse missing JSON payload")
         return jsonify({"success": False, "error": "No JSON payload provided"}), 400
+
+    logger.info(
+        "/chat/parse request query_len=%s profile_keys=%s",
+        len((data.get("query") or "")),
+        (
+            list((data.get("user_profile") or {}).keys())
+            if isinstance(data.get("user_profile"), dict)
+            else []
+        ),
+    )
 
     query = data.get("query")
     if not query:
@@ -350,6 +546,7 @@ def build_outfit_from_quiz():
     data = request.get_json()
 
     if not data:
+        logger.warning("/outfit/build/quiz missing JSON payload")
         return jsonify({"success": False, "error": "No JSON payload provided"}), 400
 
     # Wrap in the unified format
@@ -381,21 +578,52 @@ def generate_fit_images():
     """
     data = request.get_json()
     if not data:
+        logger.warning("/fits/generate-images missing JSON payload")
         return jsonify({"success": False, "error": "No JSON payload provided"}), 400
 
     user_id = data.get("user_id")
     items = data.get("items")
+    tags = data.get("tags") or []
+    profile = data.get("profile") or {}
+
+    logger.info(
+        "/fits/generate-images request user=%s item_count=%s tag_count=%s source=%s count=%s",
+        _short_user_id(user_id),
+        len(items) if isinstance(items, list) else "invalid",
+        len(tags) if isinstance(tags, list) else "invalid",
+        data.get("source") or "stylist_chat",
+        data.get("count") or 3,
+    )
 
     if not user_id:
+        logger.warning("/fits/generate-images validation failed: missing user_id")
         return (
             jsonify({"success": False, "error": "Missing required field: user_id"}),
             400,
         )
 
     if not isinstance(items, list) or len(items) == 0:
+        logger.warning(
+            "/fits/generate-images validation failed: invalid items payload_type=%s",
+            type(items).__name__,
+        )
         return (
             jsonify({"success": False, "error": "Missing required field: items"}),
             400,
+        )
+
+    missing_image_slots: List[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        slot = item.get("slot")
+        if slot in ["top", "bottom", "shoes"] and not item.get("imageUrl"):
+            missing_image_slots.append(str(slot))
+
+    if missing_image_slots:
+        logger.warning(
+            "/fits/generate-images items missing imageUrl for slots=%s",
+            missing_image_slots,
         )
 
     service = get_fit_image_service()
@@ -404,11 +632,19 @@ def generate_fit_images():
         result = service.create_fit_with_images(
             user_id=user_id,
             title=data.get("title"),
-            tags=data.get("tags") or [],
+            tags=tags,
             source=data.get("source") or "stylist_chat",
             items=items,
-            profile=data.get("profile") or {},
+            profile=profile,
             count=int(data.get("count") or 3),
+        )
+
+        logger.info(
+            "/fits/generate-images success user=%s fit_id=%s generated_count=%s profile_keys=%s",
+            _short_user_id(user_id),
+            result.get("fit", {}).get("id"),
+            len(result.get("image_urls") or []),
+            list(profile.keys()) if isinstance(profile, dict) else [],
         )
 
         return jsonify(
@@ -419,7 +655,11 @@ def generate_fit_images():
             }
         )
     except Exception as e:
-        logger.error("Fit image generation failed: %s", e)
+        logger.exception(
+            "Fit image generation failed user=%s error=%s",
+            _short_user_id(user_id),
+            e,
+        )
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -433,6 +673,7 @@ def list_user_fits():
     """
     user_id = request.args.get("user_id")
     if not user_id:
+        logger.warning("/fits missing user_id query param")
         return (
             jsonify(
                 {"success": False, "error": "Missing required query param: user_id"}
@@ -444,9 +685,14 @@ def list_user_fits():
 
     try:
         fits = service.list_fits(user_id)
+        logger.info(
+            "/fits success user=%s fit_count=%s", _short_user_id(user_id), len(fits)
+        )
         return jsonify({"success": True, "fits": fits})
     except Exception as e:
-        logger.error("Fit listing failed: %s", e)
+        logger.exception(
+            "Fit listing failed user=%s error=%s", _short_user_id(user_id), e
+        )
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -459,7 +705,19 @@ def build_outfit_from_chat():
     data = request.get_json()
 
     if not data:
+        logger.warning("/outfit/build/chat missing JSON payload")
         return jsonify({"success": False, "error": "No JSON payload provided"}), 400
+
+    logger.info(
+        "/outfit/build/chat request query_len=%s has_user_id=%s profile_keys=%s",
+        len((data.get("query") or "")),
+        bool(data.get("user_id")),
+        (
+            list((data.get("user_profile") or {}).keys())
+            if isinstance(data.get("user_profile"), dict)
+            else []
+        ),
+    )
 
     # Wrap in the unified format
     wrapped = {
