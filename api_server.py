@@ -361,7 +361,10 @@ def build_outfit():
                 user_profile=user_profile,
             )
 
-            if not (outfit.get("items") or {}):
+            has_real_items = any(
+                v is not None for v in (outfit.get("items") or {}).values()
+            )
+            if not has_real_items:
                 logger.warning(
                     "/outfit/build chat empty result; attempting quiz fallback user=%s",
                     _short_user_id(chat_user_id),
