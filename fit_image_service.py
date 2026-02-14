@@ -4,7 +4,9 @@
 import base64
 import logging
 import os
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -127,7 +129,9 @@ class FitImageService:
         normalized: List[Dict[str, Any]] = []
         for fit in fits:
             fit_images = images_by_fit.get(fit["id"], [])
-            image_urls = [self._create_signed_url(img["image_path"]) for img in fit_images]
+            image_urls = [
+                self._create_signed_url(img["image_path"]) for img in fit_images
+            ]
             normalized.append(
                 {
                     "id": fit["id"],
@@ -178,13 +182,12 @@ class FitImageService:
         if not image_parts:
             raise ValueError("Could not load any item images for generation")
 
-        generated: List[bytes] = []
         gender = profile.get("gender") or ""
         style = profile.get("style") or ""
         occasion = profile.get("occasion") or ""
 
-        for variation in range(max(1, count)):
-            prompt = self._build_prompt(gender, style, occasion, variation + 1)
+        def _call_gemini(variation: int) -> Optional[bytes]:
+            prompt = self._build_prompt(gender, style, occasion, variation)
             payload = {
                 "contents": [
                     {
@@ -192,21 +195,46 @@ class FitImageService:
                     }
                 ]
             }
-            response = requests.post(
+            t0 = time.monotonic()
+            resp = requests.post(
                 "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent",
                 params={"key": GEMINI_API_KEY},
                 json=payload,
-                timeout=90,
+                timeout=120,
             )
-            if not response.ok:
-                raise RuntimeError(
-                    f"Gemini request failed ({response.status_code}): {response.text[:250]}"
+            elapsed = time.monotonic() - t0
+            if not resp.ok:
+                logger.warning(
+                    "Gemini variation %s failed (%s) after %.1fs: %s",
+                    variation,
+                    resp.status_code,
+                    elapsed,
+                    resp.text[:200],
                 )
+                return None
+            logger.info("Gemini variation %s completed in %.1fs", variation, elapsed)
+            return self._extract_image_bytes(resp.json())
 
-            result = response.json()
-            image_bytes = self._extract_image_bytes(result)
-            if image_bytes:
-                generated.append(image_bytes)
+        t_start = time.monotonic()
+        generated: List[bytes] = []
+        with ThreadPoolExecutor(max_workers=count) as pool:
+            futures = {
+                pool.submit(_call_gemini, v + 1): v for v in range(max(1, count))
+            }
+            for future in as_completed(futures):
+                try:
+                    img = future.result()
+                    if img:
+                        generated.append(img)
+                except Exception as exc:
+                    logger.warning("Gemini worker error: %s", exc)
+
+        logger.info(
+            "Image generation total: %d/%d images in %.1fs",
+            len(generated),
+            count,
+            time.monotonic() - t_start,
+        )
 
         if not generated:
             raise RuntimeError("Gemini did not return any images")
@@ -217,7 +245,9 @@ class FitImageService:
         try:
             response = requests.get(image_url, timeout=20)
             if not response.ok:
-                logger.warning("Image fetch failed (%s): %s", response.status_code, image_url)
+                logger.warning(
+                    "Image fetch failed (%s): %s", response.status_code, image_url
+                )
                 return None
             mime_type = response.headers.get("content-type", "image/jpeg").split(";")[0]
             return {
@@ -239,21 +269,27 @@ class FitImageService:
         return None
 
     def _upload_to_storage(self, image_path: str, image_bytes: bytes) -> None:
-        upload_url = f"{SUPABASE_URL}/storage/v1/object/{FIT_IMAGES_BUCKET}/{image_path}"
+        upload_url = (
+            f"{SUPABASE_URL}/storage/v1/object/{FIT_IMAGES_BUCKET}/{image_path}"
+        )
         headers = {
             "Authorization": f"Bearer {SUPABASE_KEY}",
             "apikey": SUPABASE_KEY,
             "x-upsert": "true",
             "Content-Type": "image/png",
         }
-        response = requests.post(upload_url, headers=headers, data=image_bytes, timeout=30)
+        response = requests.post(
+            upload_url, headers=headers, data=image_bytes, timeout=30
+        )
         if response.status_code not in (200, 201):
             raise RuntimeError(
                 f"Storage upload failed ({response.status_code}): {response.text[:250]}"
             )
 
     def _create_signed_url(self, image_path: str) -> str:
-        sign_url = f"{SUPABASE_URL}/storage/v1/object/sign/{FIT_IMAGES_BUCKET}/{image_path}"
+        sign_url = (
+            f"{SUPABASE_URL}/storage/v1/object/sign/{FIT_IMAGES_BUCKET}/{image_path}"
+        )
         headers = {
             "Authorization": f"Bearer {SUPABASE_KEY}",
             "apikey": SUPABASE_KEY,
@@ -279,7 +315,9 @@ class FitImageService:
 
         return f"{SUPABASE_URL}/storage/v1{signed_path}"
 
-    def _build_prompt(self, gender: str, style: str, occasion: str, variation: int) -> str:
+    def _build_prompt(
+        self, gender: str, style: str, occasion: str, variation: int
+    ) -> str:
         return (
             "Create a photorealistic full-body fashion model image featuring the outfit items provided in the reference images. "
             "Preserve garment details, silhouettes, and colors accurately. "

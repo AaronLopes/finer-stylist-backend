@@ -3,7 +3,7 @@ services:
     name: finer-stylist-backend
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn api_server:app --bind 0.0.0.0:$PORT
+    startCommand: gunicorn api_server:app --bind 0.0.0.0:$PORT --timeout 300
     envVars:
       - key: SUPABASE_URL
         sync: false
