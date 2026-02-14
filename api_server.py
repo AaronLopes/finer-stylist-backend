@@ -32,6 +32,7 @@ from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+from fit_image_service import FitImageService
 from outfit_builder import OutfitBuilder, create_outfit_builder
 
 load_dotenv()
@@ -47,6 +48,7 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Initialize outfit builder (lazy loading)
 _outfit_builder: Optional[OutfitBuilder] = None
+_fit_image_service: Optional[FitImageService] = None
 
 
 def get_outfit_builder() -> OutfitBuilder:
@@ -54,6 +56,13 @@ def get_outfit_builder() -> OutfitBuilder:
     if _outfit_builder is None:
         _outfit_builder = create_outfit_builder()
     return _outfit_builder
+
+
+def get_fit_image_service() -> FitImageService:
+    global _fit_image_service
+    if _fit_image_service is None:
+        _fit_image_service = FitImageService()
+    return _fit_image_service
 
 
 # =============================================================================
@@ -352,6 +361,93 @@ def build_outfit_from_quiz():
     # Temporarily replace request json
     with app.test_request_context(json=wrapped):
         return build_outfit()
+
+
+@app.route("/fits/generate-images", methods=["POST"])
+def generate_fit_images():
+    """
+    Generate fit images, upload to Supabase Storage, and persist fit metadata.
+
+    Expected payload:
+    {
+      "user_id": "uuid",
+      "title": "optional title",
+      "tags": ["night-out"],
+      "source": "stylist_chat",
+      "items": [{...mapped fit item with imageUrl + slot...}],
+      "profile": {...optional style profile hints...},
+      "count": 3
+    }
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"success": False, "error": "No JSON payload provided"}), 400
+
+    user_id = data.get("user_id")
+    items = data.get("items")
+
+    if not user_id:
+        return (
+            jsonify({"success": False, "error": "Missing required field: user_id"}),
+            400,
+        )
+
+    if not isinstance(items, list) or len(items) == 0:
+        return (
+            jsonify({"success": False, "error": "Missing required field: items"}),
+            400,
+        )
+
+    service = get_fit_image_service()
+
+    try:
+        result = service.create_fit_with_images(
+            user_id=user_id,
+            title=data.get("title"),
+            tags=data.get("tags") or [],
+            source=data.get("source") or "stylist_chat",
+            items=items,
+            profile=data.get("profile") or {},
+            count=int(data.get("count") or 3),
+        )
+
+        return jsonify(
+            {
+                "success": True,
+                "fit": result["fit"],
+                "image_urls": result["image_urls"],
+            }
+        )
+    except Exception as e:
+        logger.error("Fit image generation failed: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/fits", methods=["GET"])
+def list_user_fits():
+    """
+    List persisted fits for a user, including signed image URLs.
+
+    Query params:
+      - user_id (required)
+    """
+    user_id = request.args.get("user_id")
+    if not user_id:
+        return (
+            jsonify(
+                {"success": False, "error": "Missing required query param: user_id"}
+            ),
+            400,
+        )
+
+    service = get_fit_image_service()
+
+    try:
+        fits = service.list_fits(user_id)
+        return jsonify({"success": True, "fits": fits})
+    except Exception as e:
+        logger.error("Fit listing failed: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/outfit/build/chat", methods=["POST"])
