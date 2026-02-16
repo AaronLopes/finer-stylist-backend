@@ -738,7 +738,7 @@ def build_outfit_from_chat():
 # =============================================================================
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
+    port = int(os.getenv("PORT", "10000"))
     debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
 
     app.run(
