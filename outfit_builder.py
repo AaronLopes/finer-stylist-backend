@@ -376,6 +376,13 @@ class OutfitBuilder:
         if profile:
             if profile.get("gender"):
                 gender = profile["gender"]
+                logger.info(
+                    "build_params layer=profile set gender=%s", gender
+                )
+            else:
+                logger.info(
+                    "build_params layer=profile gender=MISSING — defaulting to 'unisex' (returns mixed-gender items)"
+                )
             if profile.get("occasion"):
                 occasion = profile["occasion"]
 
@@ -421,6 +428,11 @@ class OutfitBuilder:
         # ----- Layer 2: chat overlay -----
         if chat_extract:
             if chat_extract.get("gender"):
+                logger.info(
+                    "build_params layer=chat_extract OVERRIDE gender %s -> %s",
+                    gender,
+                    chat_extract["gender"],
+                )
                 gender = chat_extract["gender"]
 
             if chat_extract.get("occasion"):
@@ -732,10 +744,12 @@ Only include fields you can confidently extract. Be concise."""
 
         for slot_config in formula.slots:
             logger.info(
-                "Building slot: %s (formality=%d, hero=%s)",
+                "Building slot: %s (formality=%d, hero=%s) gender=%s occasion=%s",
                 slot_config.slot,
                 slot_config.formality,
                 slot_config.is_hero,
+                params.gender,
+                params.occasion,
             )
 
             # Query ff_build_outfit_v3 for this slot (with affiliate boosting)
