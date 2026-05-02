@@ -691,13 +691,14 @@ def generate_fit_images():
         )
 
     service = get_fit_image_service()
+    source = data.get("source") or "stylist_chat"
 
     try:
         result = service.create_fit_with_images(
             user_id=user_id,
             title=data.get("title"),
             tags=tags,
-            source=data.get("source") or "stylist_chat",
+            source=source,
             items=items,
             profile=profile,
             count=int(data.get("count") or 3),
@@ -710,6 +711,28 @@ def generate_fit_images():
             len(result.get("image_urls") or []),
             list(profile.keys()) if isinstance(profile, dict) else [],
         )
+
+        # If this fit originated from the Today tab, write the composed image
+        # URLs back to its finer_daily_fits row so the next /outfit/build/today
+        # call this day returns them inline instead of generating again.
+        if source == "today":
+            new_fit_id = result.get("fit", {}).get("id")
+            urls = result.get("image_urls") or []
+            if new_fit_id and urls:
+                try:
+                    service.supabase.table("finer_daily_fits").update(
+                        {"image_urls": urls}
+                    ).eq("user_id", user_id).eq("fit_id", new_fit_id).execute()
+                    logger.info(
+                        "/fits/generate-images cached %s images on finer_daily_fits fit_id=%s",
+                        len(urls),
+                        new_fit_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "/fits/generate-images cache write to finer_daily_fits failed: %s",
+                        exc,
+                    )
 
         return jsonify(
             {
@@ -934,7 +957,7 @@ def build_outfit_today():
         try:
             cached = (
                 supabase_client.table("finer_daily_fits")
-                .select("fit_id, generated_at")
+                .select("fit_id, image_urls, generated_at")
                 .eq("user_id", user_id)
                 .eq("date", cache_date)
                 .eq("occasion", occasion)
@@ -943,6 +966,7 @@ def build_outfit_today():
             )
             if cached.data:
                 fit_id = cached.data[0]["fit_id"]
+                cached_image_urls = cached.data[0].get("image_urls") or []
                 fit_row = (
                     supabase_client.table("user_fits")
                     .select("*")
@@ -953,9 +977,10 @@ def build_outfit_today():
                 if fit_row.data:
                     cached_fit = fit_row.data[0]
                     logger.info(
-                        "/outfit/build/today cache hit user=%s fit_id=%s",
+                        "/outfit/build/today cache hit user=%s fit_id=%s images=%s",
                         _short_user_id(user_id),
                         fit_id,
+                        len(cached_image_urls),
                     )
                     return jsonify(
                         {
@@ -965,6 +990,7 @@ def build_outfit_today():
                             "items": cached_fit.get("items"),
                             "title": cached_fit.get("title"),
                             "occasion": occasion,
+                            "image_urls": cached_image_urls,
                         }
                     )
         except Exception as exc:
@@ -1042,6 +1068,11 @@ def build_outfit_today():
         "items": items_dict,
         "total_price": outfit.get("total_price", 0.0),
         "occasion": occasion,
+        # Empty array on first build — iOS interprets this as "trigger image
+        # generation, then call us back via /fits/generate-images". We'll
+        # write the resulting URLs into finer_daily_fits.image_urls so the
+        # next /outfit/build/today call this day returns them inline.
+        "image_urls": [],
     }
     logger.info(
         "/outfit/build/today success user=%s fit_id=%s slots=%s",
