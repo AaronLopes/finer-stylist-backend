@@ -31,6 +31,81 @@ class FitImageService:
 
         self.supabase = supabase.create_client(SUPABASE_URL, SUPABASE_KEY)
 
+    def update_fit_with_images(
+        self,
+        fit_id: str,
+        items: List[Dict[str, Any]],
+        profile: Optional[Dict[str, Any]] = None,
+        count: int = 3,
+    ) -> Dict[str, Any]:
+        """Generate Gemini images for an EXISTING fit row and attach them.
+
+        Used so a Today fit (already persisted via save_fit when /outfit/build/today
+        ran) gets its outfit pictures appended to the same row instead of
+        spawning a duplicate. The fit_id must already exist in user_fits.
+        """
+        slots = self._extract_slots(items)
+        generated_images = self._generate_images(
+            top_image=slots.get("top") or "",
+            bottom_image=slots.get("bottom") or "",
+            shoes_image=slots.get("shoes") or "",
+            profile=profile or {},
+            count=count,
+        )
+
+        # Touch the fit's updated_at so the Fits list re-orders correctly.
+        existing = (
+            self.supabase.table("user_fits")
+            .select("*")
+            .eq("id", fit_id)
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            raise RuntimeError(f"fit_id {fit_id} does not exist in user_fits")
+        fit_row = existing.data[0]
+        user_id = fit_row["user_id"]
+
+        self.supabase.table("user_fits").update(
+            {"updated_at": datetime.utcnow().isoformat()}
+        ).eq("id", fit_id).execute()
+
+        image_rows: List[Dict[str, Any]] = []
+        image_urls: List[str] = []
+
+        for idx, image_bytes in enumerate(generated_images):
+            image_path = f"{user_id}/{fit_id}/{idx + 1}.png"
+            self._upload_to_storage(image_path, image_bytes)
+            signed_url = self._create_signed_url(image_path)
+
+            image_rows.append(
+                {
+                    "fit_id": fit_id,
+                    "user_id": user_id,
+                    "image_path": image_path,
+                    "position": idx,
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            )
+            image_urls.append(signed_url)
+
+        if image_rows:
+            self.supabase.table("user_fit_images").insert(image_rows).execute()
+
+        return {
+            "fit": {
+                "id": fit_id,
+                "user_id": user_id,
+                "title": fit_row.get("title"),
+                "source": fit_row.get("source"),
+                "tags": fit_row.get("tags") or [],
+                "items": fit_row.get("items") or [],
+                "created_at": fit_row.get("created_at"),
+            },
+            "image_urls": image_urls,
+        }
+
     def save_fit(
         self,
         user_id: str,
