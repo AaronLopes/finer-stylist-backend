@@ -224,6 +224,70 @@ BUDGET_RANGES: Dict[str, Dict[str, float]] = {
     "$$$$": {"min": 0, "max": 10000},  # Luxury - no limits
 }
 
+# Calendar event keyword → occasion. Substring-matched against event title.
+# Order matters only when keywords overlap; keep most-specific first.
+CALENDAR_OCCASION_MAP: Dict[str, str] = {
+    # Work-ish
+    "standup": "work",
+    "stand-up": "work",
+    "1:1": "work",
+    "interview": "work",
+    "presentation": "work",
+    "conference": "work",
+    "review": "work",
+    "sprint": "work",
+    "office": "work",
+    "meeting": "work",
+    # Date-ish
+    "anniversary": "date",
+    "date night": "date",
+    "dinner with": "date",
+    "dinner": "date",
+    "drinks with": "date",
+    # Going-out
+    "wedding": "going-out",
+    "gala": "going-out",
+    "concert": "going-out",
+    "club": "going-out",
+    "party": "going-out",
+    "show": "going-out",
+    # Gym
+    "workout": "gym",
+    "yoga": "gym",
+    "pilates": "gym",
+    "training": "gym",
+    "gym": "gym",
+    "run": "gym",
+}
+
+
+def _temp_to_weather_bucket(temp_f: float) -> str:
+    """Map a Fahrenheit temperature to a WEATHER_TAG_MAP bucket."""
+    if temp_f < 50:
+        return "cold"
+    if temp_f >= 75:
+        return "hot"
+    return "moderate"
+
+
+def _event_to_occasion(event: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    Map a calendar event dict {title, category?, all_day?} to an OCCASION_FORMULAS key.
+    Returns None when no confident match — caller falls through to profile/default.
+    """
+    if not event:
+        return None
+    category = (event.get("category") or "").lower()
+    if category in OCCASION_FORMULAS:
+        return category
+    title = (event.get("title") or "").lower()
+    if not title:
+        return None
+    for keyword, occasion in CALENDAR_OCCASION_MAP.items():
+        if keyword in title:
+            return occasion
+    return None
+
 
 class OutfitBuilder:
     """
@@ -273,92 +337,170 @@ class OutfitBuilder:
         # Build outfit slot by slot
         return self._build_outfit(params, formula)
 
-    def _quiz_to_params(self, quiz: Dict[str, Any]) -> OutfitParams:
-        """Convert quiz answers to OutfitParams."""
+    # =========================================================================
+    # CANONICAL PARAMS BUILDER (used by quiz, chat, and today)
+    # =========================================================================
 
-        occasion = quiz.get("occasion", "casual")
+    def build_params(
+        self,
+        *,
+        profile: Optional[Dict[str, Any]] = None,
+        chat_extract: Optional[Dict[str, Any]] = None,
+        today_context: Optional[Dict[str, Any]] = None,
+    ) -> OutfitParams:
+        """
+        Single canonical translator from any input shape to OutfitParams.
 
-        # Check if this occasion has a style override (gym, beach, etc.)
-        # If so, use occasion-specific tags instead of generic style/setting tags
-        if occasion in OCCASION_STYLE_OVERRIDE:
-            # For gym/beach: use specific activewear/swimwear tags
-            style_tags = OCCASION_STYLE_OVERRIDE[occasion].copy()
-            logger.info("Using occasion override tags for %s: %s", occasion, style_tags)
-        else:
-            # Normal flow: collect style tags from quiz
-            style_tags = []
-            style = quiz.get("style")
-            if style and style in STYLE_TAG_MAP:
-                style_tags.extend(STYLE_TAG_MAP[style])
+        Layers (each overrides only the fields it provides):
+            1. profile          — quiz-style structured answers (base layer)
+            2. chat_extract     — gpt-4o-mini extraction from a NL query
+            3. today_context    — live weather + calendar from device
 
-            # Add setting tags
-            setting = quiz.get("setting")
-            if setting and setting in SETTING_TAG_MAP:
-                style_tags.extend(SETTING_TAG_MAP[setting])
+        Live signals (Today) win over chat hints, which win over stored profile.
+        """
 
-        # Collect season/weather tags
-        season_tags = []
-        avoid_tags = []
-        weather_list = quiz.get("weather", ["moderate"])
-        if isinstance(weather_list, str):
-            weather_list = [weather_list]
-
-        for weather in weather_list:
-            if weather in WEATHER_TAG_MAP:
-                weather_config = WEATHER_TAG_MAP[weather]
-                season_tags.extend(weather_config.get("season_tags", []))
-                avoid_tags.extend(weather_config.get("avoid_tags", []))
-
-        # Occasion tags
-        occasion_tags = [occasion.replace("-", "_")]
-
-        # Budget
-        budget_key = quiz.get("budget", "$$")
-        budget_range = BUDGET_RANGES.get(budget_key, BUDGET_RANGES["$$"])
-
-        # Goals → strategy
-        goals = quiz.get("goals", [])
-        if isinstance(goals, str):
-            goals = [goals]
-
+        # Defaults
+        gender = "unisex"
+        occasion = "casual"
+        style_tags: List[str] = []
+        season_tags: List[str] = []
+        avoid_tags: List[str] = []
+        budget_min = 0.0
+        budget_max = 10000.0
         hero_boost = 1.0
         color_strategy = ColorStrategy.BALANCED
         boost_affiliates = True
-        affiliate_boost_weight = 0.15  # Default boost
+        affiliate_boost_weight = 0.15
 
-        for goal in goals:
-            if goal in GOALS_STRATEGY:
-                strategy = GOALS_STRATEGY[goal]
-                hero_boost = max(hero_boost, strategy.get("hero_boost", 1.0))
-                if strategy.get("color_strategy"):
-                    color_strategy = strategy["color_strategy"]
-                # Use highest affiliate boost if multiple goals
-                if strategy.get("affiliate_boost_weight", 0) > affiliate_boost_weight:
-                    affiliate_boost_weight = strategy["affiliate_boost_weight"]
-                if "boost_affiliates" in strategy:
-                    boost_affiliates = strategy["boost_affiliates"]
+        # ----- Layer 1: profile (quiz logic) -----
+        if profile:
+            if profile.get("gender"):
+                gender = profile["gender"]
+            if profile.get("occasion"):
+                occasion = profile["occasion"]
+
+            if occasion in OCCASION_STYLE_OVERRIDE:
+                style_tags = OCCASION_STYLE_OVERRIDE[occasion].copy()
+            else:
+                style = profile.get("style")
+                if style and style in STYLE_TAG_MAP:
+                    style_tags.extend(STYLE_TAG_MAP[style])
+                setting = profile.get("setting")
+                if setting and setting in SETTING_TAG_MAP:
+                    style_tags.extend(SETTING_TAG_MAP[setting])
+
+            weather_list = profile.get("weather") or []
+            if isinstance(weather_list, str):
+                weather_list = [weather_list]
+            for weather in weather_list:
+                if weather in WEATHER_TAG_MAP:
+                    cfg = WEATHER_TAG_MAP[weather]
+                    season_tags.extend(cfg.get("season_tags", []))
+                    avoid_tags.extend(cfg.get("avoid_tags", []))
+
+            budget_key = profile.get("budget")
+            if budget_key and budget_key in BUDGET_RANGES:
+                br = BUDGET_RANGES[budget_key]
+                budget_min = br["min"]
+                budget_max = br["max"]
+
+            goals = profile.get("goals") or []
+            if isinstance(goals, str):
+                goals = [goals]
+            for goal in goals:
+                if goal in GOALS_STRATEGY:
+                    strategy = GOALS_STRATEGY[goal]
+                    hero_boost = max(hero_boost, strategy.get("hero_boost", 1.0))
+                    if strategy.get("color_strategy"):
+                        color_strategy = strategy["color_strategy"]
+                    if strategy.get("affiliate_boost_weight", 0) > affiliate_boost_weight:
+                        affiliate_boost_weight = strategy["affiliate_boost_weight"]
+                    if "boost_affiliates" in strategy:
+                        boost_affiliates = strategy["boost_affiliates"]
+
+        # ----- Layer 2: chat overlay -----
+        if chat_extract:
+            if chat_extract.get("gender"):
+                gender = chat_extract["gender"]
+
+            if chat_extract.get("occasion"):
+                occasion = chat_extract["occasion"]
+                # Re-apply override if the new occasion has one (gym/beach)
+                if occasion in OCCASION_STYLE_OVERRIDE:
+                    style_tags = OCCASION_STYLE_OVERRIDE[occasion].copy()
+
+            # Append (don't replace) embedding-matched style tags so chat hints
+            # narrow rather than overwrite the profile's curated tag set.
+            descriptors = chat_extract.get("style_descriptors") or []
+            if descriptors:
+                matched = self._match_tags_by_embedding(descriptors)
+                style_tags.extend(matched)
+
+            # Setting hint maps the same way as profile's setting field
+            setting_hint = chat_extract.get("setting_hint")
+            if setting_hint and setting_hint in SETTING_TAG_MAP:
+                style_tags.extend(SETTING_TAG_MAP[setting_hint])
+
+            # Weather hint only if profile didn't already set season tags
+            weather_hint = chat_extract.get("weather_hint")
+            if weather_hint and weather_hint in WEATHER_TAG_MAP and not season_tags:
+                cfg = WEATHER_TAG_MAP[weather_hint]
+                season_tags.extend(cfg.get("season_tags", []))
+                avoid_tags.extend(cfg.get("avoid_tags", []))
+
+            if chat_extract.get("budget_max"):
+                budget_max = float(chat_extract["budget_max"])
+                budget_min = 0.0
+
+        # ----- Layer 3: today overlay (live signals win) -----
+        if today_context:
+            temp_f = today_context.get("temp_f")
+            if temp_f is not None:
+                bucket = _temp_to_weather_bucket(float(temp_f))
+                cfg = WEATHER_TAG_MAP[bucket]
+                # Replace, not append — live weather is authoritative
+                season_tags = list(cfg.get("season_tags", []))
+                avoid_tags = list(cfg.get("avoid_tags", []))
+
+            inferred_event_occasion = _event_to_occasion(
+                today_context.get("primary_event")
+            )
+            if inferred_event_occasion:
+                occasion = inferred_event_occasion
+                if occasion in OCCASION_STYLE_OVERRIDE:
+                    style_tags = OCCASION_STYLE_OVERRIDE[occasion].copy()
+
+        # Occasion tag is always derived from the final occasion
+        occasion_tags = [occasion.replace("-", "_")]
 
         return OutfitParams(
-            gender=quiz.get("gender", "unisex"),
+            gender=gender,
             occasion=occasion,
-            budget_min=budget_range["min"],
-            budget_max=budget_range["max"],
-            style_tags=list(set(style_tags)),
+            budget_min=budget_min,
+            budget_max=budget_max,
+            style_tags=list(dict.fromkeys(style_tags)),
             occasion_tags=occasion_tags,
-            season_tags=list(set(season_tags)),
-            avoid_tags=list(set(avoid_tags)),
+            season_tags=list(dict.fromkeys(season_tags)),
+            avoid_tags=list(dict.fromkeys(avoid_tags)),
             hero_boost=hero_boost,
             color_strategy=color_strategy,
             boost_affiliates=boost_affiliates,
             affiliate_boost_weight=affiliate_boost_weight,
         )
 
+    def _quiz_to_params(self, quiz: Dict[str, Any]) -> OutfitParams:
+        """Backward-compatible alias. New code should call build_params(profile=...)."""
+        return self.build_params(profile=quiz)
+
     # =========================================================================
     # CHAT MODE
     # =========================================================================
 
     def build_from_chat(
-        self, query: str, user_profile: Optional[Dict[str, Any]] = None
+        self,
+        query: str,
+        user_profile: Optional[Dict[str, Any]] = None,
+        context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Build an outfit from a natural language query.
@@ -366,33 +508,51 @@ class OutfitBuilder:
         Args:
             query: "something flowy and romantic for a vineyard date, under $200"
             user_profile: Optional saved user preferences (gender, etc.)
+            context: Optional follow-up context {intent, original_query, last_outfit_summary}
 
         Returns:
             Complete outfit with items for each slot
         """
         logger.info("Building outfit from chat: %s", query)
 
-        # Parse query into structured params
-        params = self.parse_chat_query(query, user_profile)
+        params = self.parse_chat_query(query, user_profile, context)
 
-        # Infer occasion from query or default
-        occasion = self._infer_occasion_from_query(query)
-        formula = OCCASION_FORMULAS.get(occasion, OCCASION_FORMULAS["casual"])
-
-        # Build outfit
+        # Use the resolved occasion from build_params (LLM extraction → keyword
+        # fallback → profile → "casual"). Avoids the prior dual-source bug
+        # where _infer_occasion_from_query overrode the LLM result.
+        formula = OCCASION_FORMULAS.get(params.occasion, OCCASION_FORMULAS["casual"])
         return self._build_outfit(params, formula)
 
     def parse_chat_query(
-        self, query: str, user_profile: Optional[Dict[str, Any]] = None
+        self,
+        query: str,
+        user_profile: Optional[Dict[str, Any]] = None,
+        context: Optional[Dict[str, Any]] = None,
     ) -> OutfitParams:
         """
-        Parse natural language query into OutfitParams using GPT-4o-mini.
+        Parse a natural language query (with optional follow-up context) into
+        OutfitParams via gpt-4o-mini extraction layered onto the user's profile.
 
-        This is a public method that can be called directly for the /api/chat/parse endpoint.
+        Public — also called by /api/chat/parse for previewing intent.
         """
         user_profile = user_profile or {}
+        context = context or {}
 
-        # Use GPT-4o-mini to extract structured intent
+        intent = context.get("intent") or "new_query"
+        original_query = context.get("original_query") or ""
+        last_outfit_summary = context.get("last_outfit_summary") or ""
+
+        # If this is a refinement, surface the prior turn so the parser knows
+        # which fields the user is changing vs preserving.
+        if intent == "refine_existing" and (original_query or last_outfit_summary):
+            user_content = (
+                f"Previous request: {original_query or '(none)'}\n"
+                f"Previous outfit: {last_outfit_summary or '(none)'}\n"
+                f"Refinement: {query}"
+            )
+        else:
+            user_content = query
+
         system_prompt = """You are a fashion query parser. Extract structured information from user queries about outfits.
 
 Return a JSON object with these fields:
@@ -410,100 +570,115 @@ Only include fields you can confidently extract. Be concise."""
                 model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": query},
+                    {"role": "user", "content": user_content},
                 ],
                 response_format={"type": "json_object"},
                 max_tokens=200,
             )
-
             extracted = json.loads(response.choices[0].message.content)
-            logger.info("Extracted from query: %s", extracted)
-
+            logger.info("Extracted from query (intent=%s): %s", intent, extracted)
         except Exception as e:
             logger.error("Failed to parse query: %s", e)
             extracted = {}
 
-        # Map style descriptors to tags via embedding similarity
-        style_tags = []
-        style_descriptors = extracted.get("style_descriptors", [])
-        if style_descriptors:
-            style_tags = self._match_tags_by_embedding(style_descriptors)
+        # Keyword inference is a *fallback* when the LLM didn't return an
+        # occasion — never an override.
+        if not extracted.get("occasion"):
+            inferred = self._infer_occasion_from_query(query)
+            if inferred and inferred != "casual":
+                extracted["occasion"] = inferred
 
-        # Add setting tags if hint provided
-        setting_hint = extracted.get("setting_hint")
-        if setting_hint and setting_hint in SETTING_TAG_MAP:
-            style_tags.extend(SETTING_TAG_MAP[setting_hint])
-
-        # Weather → season tags
-        season_tags = []
-        avoid_tags = []
-        weather_hint = extracted.get("weather_hint")
-        if weather_hint and weather_hint in WEATHER_TAG_MAP:
-            weather_config = WEATHER_TAG_MAP[weather_hint]
-            season_tags = weather_config.get("season_tags", [])
-            avoid_tags = weather_config.get("avoid_tags", [])
-
-        # Budget
-        budget_max = extracted.get("budget_max", 300) or 300
-
-        # Gender from profile or extraction
-        gender = user_profile.get("gender") or extracted.get("gender") or "unisex"
-
-        # Occasion
-        occasion = extracted.get("occasion") or "casual"
-
-        return OutfitParams(
-            gender=gender,
-            occasion=occasion,
-            budget_min=0,
-            budget_max=budget_max,
-            style_tags=list(set(style_tags)),
-            occasion_tags=[occasion.replace("-", "_")],
-            season_tags=season_tags,
-            avoid_tags=avoid_tags,
-            hero_boost=1.0,
-            color_strategy=ColorStrategy.BALANCED,
-        )
+        return self.build_params(profile=user_profile, chat_extract=extracted)
 
     def _match_tags_by_embedding(self, descriptors: List[str]) -> List[str]:
         """
         Match style descriptors to product tags using embedding similarity.
 
-        Args:
-            descriptors: ["flowy", "romantic", "edgy"]
-
-        Returns:
-            Matching tags from vocabulary: ["bohemian", "relaxed", "fitted"]
+        One embedding per descriptor (batched in a single OpenAI call) plus one
+        match_tags RPC per descriptor. Returns up to ~4 tags per descriptor,
+        deduped — keeps the resulting tag set tight so the SQL scorer's
+        proportion-of-tags-found metric isn't diluted into noise.
         """
+        descriptors = [d for d in (descriptors or []) if d and d.strip()][:5]
         if not descriptors:
             return []
 
         try:
-            # Generate embedding for combined descriptors
-            combined_text = " ".join(descriptors)
             response = self.openai.embeddings.create(
                 model="text-embedding-3-small",
-                input=combined_text,
+                input=descriptors,
             )
-            query_embedding = response.data[0].embedding
-
-            # Query Supabase for matching tags
-            result = self.supabase.rpc(
-                "match_tags",
-                {
-                    "query_embedding": query_embedding,
-                    "match_count": 8,
-                    "match_threshold": 0.3,
-                },
-            ).execute()
-
-            matched_tags = [row["tag"] for row in result.data]
-            logger.info("Matched tags for '%s': %s", combined_text, matched_tags)
-            return matched_tags
-
         except Exception as e:
-            logger.error("Tag matching failed: %s", e)
+            logger.error("Embedding generation failed: %s", e)
             return []
+
+        matched_tags: List[str] = []
+        for descriptor, emb_obj in zip(descriptors, response.data):
+            try:
+                result = self.supabase.rpc(
+                    "match_tags",
+                    {
+                        "query_embedding": emb_obj.embedding,
+                        "match_count": 4,
+                        "match_threshold": 0.3,
+                    },
+                ).execute()
+                for row in result.data or []:
+                    tag = row.get("tag")
+                    if tag and tag not in matched_tags:
+                        matched_tags.append(tag)
+            except Exception as e:
+                logger.warning(
+                    "Tag matching failed for descriptor '%s': %s", descriptor, e
+                )
+                continue
+
+        logger.info("Matched tags for %s: %s", descriptors, matched_tags)
+        return matched_tags
+
+    # =========================================================================
+    # TODAY MODE
+    # =========================================================================
+
+    def build_for_today(
+        self,
+        profile: Optional[Dict[str, Any]] = None,
+        today_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Build an outfit for the Today tab using live weather + calendar context
+        layered on the user's stored profile.
+
+        Args:
+            profile: StyleProfile dict — base preferences
+            today_context: {
+                "lat": float | None,
+                "lon": float | None,
+                "temp_f": float | None,
+                "condition": str | None,         # "sunny" / "rainy" / etc.
+                "daypart": str | None,           # "morning" / "afternoon" / "evening"
+                "primary_event": {               # may be None / omitted
+                    "title": str,
+                    "category": str | None,
+                    "all_day": bool | None,
+                } | None,
+            }
+
+        Returns:
+            Complete outfit dict (same shape as build_from_quiz / build_from_chat).
+        """
+        logger.info(
+            "Building outfit for today: profile_keys=%s context_keys=%s",
+            list((profile or {}).keys()),
+            list((today_context or {}).keys()),
+        )
+        params = self.build_params(profile=profile, today_context=today_context)
+        formula = OCCASION_FORMULAS.get(params.occasion, OCCASION_FORMULAS["casual"])
+        return self._build_outfit(params, formula)
+
+    # =========================================================================
+    # CHAT HELPERS
+    # =========================================================================
 
     def _infer_occasion_from_query(self, query: str) -> str:
         """Simple keyword-based occasion inference."""

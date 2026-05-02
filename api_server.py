@@ -357,9 +357,11 @@ def build_outfit():
                 list(user_profile.keys()) if isinstance(user_profile, dict) else [],
             )
 
+            chat_context = chat_query.get("context") or None
             outfit = builder.build_from_chat(
                 query=query_text,
                 user_profile=user_profile,
+                context=chat_context,
             )
 
             has_real_items = any(
@@ -562,6 +564,64 @@ def build_outfit_from_quiz():
     # Temporarily replace request json
     with app.test_request_context(json=wrapped):
         return build_outfit()
+
+
+@app.route("/fits", methods=["POST"])
+def save_fit():
+    """
+    Persist a fit's metadata without generating images. Used so chat-built
+    fits land in the user's Fits tab immediately on creation.
+
+    Expected payload:
+    {
+      "user_id": "uuid",
+      "title": "optional",
+      "tags": ["date"],
+      "source": "stylist_chat" | "today" | ...,
+      "items": [{ id, slot, name, brand?, price?, imageUrl?, link? }, ...]
+    }
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"success": False, "error": "No JSON payload provided"}), 400
+
+    user_id = data.get("user_id")
+    items = data.get("items")
+    tags = data.get("tags") or []
+
+    if not user_id:
+        return (
+            jsonify({"success": False, "error": "Missing required field: user_id"}),
+            400,
+        )
+    if not isinstance(items, list) or not items:
+        return (
+            jsonify({"success": False, "error": "Missing required field: items"}),
+            400,
+        )
+
+    service = get_fit_image_service()
+    try:
+        fit = service.save_fit(
+            user_id=user_id,
+            title=data.get("title"),
+            tags=tags,
+            source=data.get("source") or "stylist_chat",
+            items=items,
+        )
+        logger.info(
+            "/fits saved user=%s fit_id=%s source=%s item_count=%s",
+            _short_user_id(user_id),
+            fit.get("id"),
+            data.get("source") or "stylist_chat",
+            len(items),
+        )
+        return jsonify({"success": True, "fit": fit})
+    except Exception as e:
+        logger.exception(
+            "Save fit failed user=%s error=%s", _short_user_id(user_id), e
+        )
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/fits/generate-images", methods=["POST"])
@@ -809,6 +869,187 @@ def build_outfit_from_chat():
         logger.warning("/outfit/build/chat composer enrichment failed: %s", exc)
 
     return base_response
+
+
+@app.route("/outfit/build/today", methods=["POST"])
+def build_outfit_today():
+    """
+    Build (or fetch cached) outfit for the Today tab.
+
+    Cache key: (user_id, today's date in user's locale, inferred occasion).
+    A second request the same day with the same occasion returns the cached
+    fit. A different inferred occasion (lunch meeting → dinner date)
+    generates a new fit.
+
+    Expected payload:
+    {
+      "user_id": "uuid" | null,            # required for cache; without it, no cache
+      "profile": { ...StyleProfile },      # required for sane fallback
+      "today_context": {
+        "lat": float | null,
+        "lon": float | null,
+        "temp_f": float | null,
+        "condition": "sunny" | "rainy" | ... | null,
+        "daypart": "morning" | "afternoon" | "evening" | null,
+        "primary_event": {                 # null if calendar denied / empty
+          "title": str,
+          "category": str | null,
+          "all_day": bool | null
+        } | null,
+        "local_date": "YYYY-MM-DD" | null  # iOS-supplied for cache key
+      }
+    }
+    """
+    from datetime import date as _date
+
+    data = request.get_json()
+    if not data:
+        return jsonify({"success": False, "error": "No JSON payload provided"}), 400
+
+    user_id = data.get("user_id")
+    profile = data.get("profile") or {}
+    today_context = data.get("today_context") or {}
+    local_date_str = today_context.get("local_date")
+
+    builder = get_outfit_builder()
+
+    # Resolve params first so we know the inferred occasion (cache key component)
+    params = builder.build_params(profile=profile, today_context=today_context)
+    occasion = params.occasion
+    cache_date = local_date_str or _date.today().isoformat()
+
+    logger.info(
+        "/outfit/build/today user=%s date=%s occasion=%s context_keys=%s",
+        _short_user_id(user_id),
+        cache_date,
+        occasion,
+        list(today_context.keys()),
+    )
+
+    fit_service = get_fit_image_service()
+    supabase_client = fit_service.supabase
+
+    # ----- Cache lookup -----
+    if user_id:
+        try:
+            cached = (
+                supabase_client.table("finer_daily_fits")
+                .select("fit_id, generated_at")
+                .eq("user_id", user_id)
+                .eq("date", cache_date)
+                .eq("occasion", occasion)
+                .limit(1)
+                .execute()
+            )
+            if cached.data:
+                fit_id = cached.data[0]["fit_id"]
+                fit_row = (
+                    supabase_client.table("user_fits")
+                    .select("*")
+                    .eq("id", fit_id)
+                    .limit(1)
+                    .execute()
+                )
+                if fit_row.data:
+                    cached_fit = fit_row.data[0]
+                    logger.info(
+                        "/outfit/build/today cache hit user=%s fit_id=%s",
+                        _short_user_id(user_id),
+                        fit_id,
+                    )
+                    return jsonify(
+                        {
+                            "success": True,
+                            "cached": True,
+                            "fit_id": fit_id,
+                            "items": cached_fit.get("items"),
+                            "title": cached_fit.get("title"),
+                            "occasion": occasion,
+                        }
+                    )
+        except Exception as exc:
+            logger.warning("/outfit/build/today cache lookup failed: %s", exc)
+
+    # ----- Cache miss → generate -----
+    try:
+        outfit = builder.build_for_today(profile=profile, today_context=today_context)
+    except Exception as exc:
+        logger.exception(
+            "/outfit/build/today build failed user=%s error=%s",
+            _short_user_id(user_id),
+            exc,
+        )
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+    items_dict = outfit.get("items") or {}
+    has_items = any(v is not None for v in items_dict.values())
+    if not has_items:
+        return (
+            jsonify({"success": False, "error": "No products found for today's context"}),
+            404,
+        )
+
+    # Persist as a regular fit so it appears in the user's Fits tab.
+    saved_fit = None
+    fit_items_payload = []
+    for slot, product in items_dict.items():
+        if not product:
+            continue
+        fit_items_payload.append(
+            {
+                "id": str(product.get("product_id") or ""),
+                "slot": "shoes" if slot == "footwear" else slot,
+                "name": product.get("product_title") or "Untitled",
+                "brand": "FinerFit",
+                "price": float(product.get("product_price_amount") or 0),
+                "imageUrl": product.get("product_img_link"),
+                "link": product.get("product_link"),
+            }
+        )
+
+    if user_id and fit_items_payload:
+        try:
+            saved_fit = fit_service.save_fit(
+                user_id=user_id,
+                title=f"Today's {occasion.replace('-', ' ').title()} Look",
+                tags=[occasion],
+                source="today",
+                items=fit_items_payload,
+            )
+        except Exception as exc:
+            logger.warning("/outfit/build/today fit persistence failed: %s", exc)
+
+        # Cache row only if persistence succeeded (we need the fit_id)
+        if saved_fit and saved_fit.get("id"):
+            try:
+                supabase_client.table("finer_daily_fits").upsert(
+                    {
+                        "user_id": user_id,
+                        "date": cache_date,
+                        "occasion": occasion,
+                        "fit_id": saved_fit["id"],
+                        "context_snapshot": today_context,
+                    },
+                    on_conflict="user_id,date,occasion",
+                ).execute()
+            except Exception as exc:
+                logger.warning("/outfit/build/today cache write failed: %s", exc)
+
+    response_payload = {
+        "success": True,
+        "cached": False,
+        "fit_id": saved_fit.get("id") if saved_fit else None,
+        "items": items_dict,
+        "total_price": outfit.get("total_price", 0.0),
+        "occasion": occasion,
+    }
+    logger.info(
+        "/outfit/build/today success user=%s fit_id=%s slots=%s",
+        _short_user_id(user_id),
+        response_payload["fit_id"],
+        list(items_dict.keys()),
+    )
+    return jsonify(response_payload)
 
 
 # =============================================================================
