@@ -32,6 +32,7 @@ from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+from chat_service import get_chat_composer, get_chat_resolver
 from fit_image_service import FitImageService
 from outfit_builder import OutfitBuilder, create_outfit_builder
 
@@ -699,11 +700,52 @@ def list_user_fits():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/chat/resolve-intent", methods=["POST"])
+def resolve_chat_intent():
+    """
+    Resolve an ambiguous user message into a standalone outfit query.
+    Called by the mobile app when client-side confidence is low.
+
+    Expects JSON:
+        - message: the user's raw text
+        - last_query: the previous outfit query
+        - last_outfit_summary: (optional) item names from the last outfit
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"success": False, "error": "No JSON payload provided"}), 400
+
+    message = data.get("message", "")
+    last_query = data.get("last_query", "")
+
+    if not message:
+        return (
+            jsonify({"success": False, "error": "Missing required field: message"}),
+            400,
+        )
+
+    logger.info(
+        "/chat/resolve-intent msg_len=%s last_query_len=%s",
+        len(message),
+        len(last_query),
+    )
+
+    resolver = get_chat_resolver()
+    result = resolver.resolve(
+        user_message=message,
+        last_query=last_query,
+        last_outfit_summary=data.get("last_outfit_summary", ""),
+    )
+
+    return jsonify({"success": True, **result})
+
+
 @app.route("/outfit/build/chat", methods=["POST"])
 def build_outfit_from_chat():
     """
     Convenience endpoint for chat mode.
     Equivalent to POST /api/outfit/build with mode="chat"
+    Enriches response with natural stylist reply via ChatResponseComposer.
     """
     data = request.get_json()
 
@@ -711,10 +753,14 @@ def build_outfit_from_chat():
         logger.warning("/outfit/build/chat missing JSON payload")
         return jsonify({"success": False, "error": "No JSON payload provided"}), 400
 
+    query = data.get("query") or ""
+    intent = (data.get("context") or {}).get("intent", "new_query")
+
     logger.info(
-        "/outfit/build/chat request query_len=%s has_user_id=%s profile_keys=%s",
-        len((data.get("query") or "")),
+        "/outfit/build/chat request query_len=%s has_user_id=%s intent=%s profile_keys=%s",
+        len(query),
         bool(data.get("user_id")),
+        intent,
         (
             list((data.get("user_profile") or {}).keys())
             if isinstance(data.get("user_profile"), dict)
@@ -728,9 +774,41 @@ def build_outfit_from_chat():
         "chat_query": data,
     }
 
-    # Temporarily replace request json
+    # Get the base outfit response
     with app.test_request_context(json=wrapped):
-        return build_outfit()
+        base_response = build_outfit()
+
+    # Parse the base response to enrich with stylist reply
+    try:
+        base_data = base_response.get_json()
+
+        if base_data.get("success") and base_data.get("items"):
+            items = base_data["items"]
+            item_names = [
+                v.get("product_title", "item")
+                for v in items.values()
+                if v is not None and isinstance(v, dict)
+            ]
+            outfit_summary = ", ".join(item_names[:4])
+
+            composer = get_chat_composer()
+            composed = composer.compose_reply(
+                query=query,
+                outfit_summary=outfit_summary,
+                intent=intent,
+                user_profile=data.get("user_profile"),
+            )
+
+            base_data["reply_text"] = composed["reply_text"]
+            base_data["follow_up_chips"] = composed["follow_up_chips"]
+            base_data["cta_hint"] = composed["cta_hint"]
+
+            return jsonify(base_data)
+
+    except Exception as exc:
+        logger.warning("/outfit/build/chat composer enrichment failed: %s", exc)
+
+    return base_response
 
 
 # =============================================================================
