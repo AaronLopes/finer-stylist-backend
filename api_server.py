@@ -692,17 +692,28 @@ def generate_fit_images():
 
     service = get_fit_image_service()
     source = data.get("source") or "stylist_chat"
+    existing_fit_id = data.get("fit_id")
 
     try:
-        result = service.create_fit_with_images(
-            user_id=user_id,
-            title=data.get("title"),
-            tags=tags,
-            source=source,
-            items=items,
-            profile=profile,
-            count=int(data.get("count") or 3),
-        )
+        if existing_fit_id:
+            # Update path — used so Today's already-persisted fit doesn't
+            # spawn a duplicate row when iOS auto-triggers image gen.
+            result = service.update_fit_with_images(
+                fit_id=existing_fit_id,
+                items=items,
+                profile=profile,
+                count=int(data.get("count") or 3),
+            )
+        else:
+            result = service.create_fit_with_images(
+                user_id=user_id,
+                title=data.get("title"),
+                tags=tags,
+                source=source,
+                items=items,
+                profile=profile,
+                count=int(data.get("count") or 3),
+            )
 
         logger.info(
             "/fits/generate-images success user=%s fit_id=%s generated_count=%s profile_keys=%s",
@@ -894,6 +905,32 @@ def build_outfit_from_chat():
     return base_response
 
 
+def _persisted_items_to_api_dict(persisted_items: Any) -> Dict[str, Dict[str, Any]]:
+    """Convert the persisted user_fits.items list back to the {slot: product_dict}
+    shape that /outfit/build/today returns on cache miss. Without this, cache
+    HIT and cache MISS responses had different shapes — iOS decoded the cache
+    hit as empty and rendered the Today empty state.
+    """
+    if not isinstance(persisted_items, list):
+        return {}
+    result: Dict[str, Dict[str, Any]] = {}
+    for item in persisted_items:
+        if not isinstance(item, dict):
+            continue
+        slot = item.get("slot") or "unknown"
+        # Persisted format normalizes "footwear" to "shoes"; reverse for the
+        # API's slot-keyed dict that the rest of the response uses.
+        api_slot = "footwear" if slot == "shoes" else slot
+        result[api_slot] = {
+            "product_id": item.get("id"),
+            "product_title": item.get("name"),
+            "product_price_amount": item.get("price"),
+            "product_img_link": item.get("imageUrl"),
+            "product_link": item.get("link"),
+        }
+    return result
+
+
 @app.route("/outfit/build/today", methods=["POST"])
 def build_outfit_today():
     """
@@ -987,7 +1024,9 @@ def build_outfit_today():
                             "success": True,
                             "cached": True,
                             "fit_id": fit_id,
-                            "items": cached_fit.get("items"),
+                            # Convert persisted list back to {slot: product_dict}
+                            # so iOS gets the same shape as on cache miss.
+                            "items": _persisted_items_to_api_dict(cached_fit.get("items")),
                             "title": cached_fit.get("title"),
                             "occasion": occasion,
                             "image_urls": cached_image_urls,
