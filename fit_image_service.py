@@ -31,6 +31,41 @@ class FitImageService:
 
         self.supabase = supabase.create_client(SUPABASE_URL, SUPABASE_KEY)
 
+    def save_fit(
+        self,
+        user_id: str,
+        title: Optional[str],
+        tags: List[str],
+        source: str,
+        items: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Persist a fit's metadata without generating images.
+
+        Used so chat-built fits appear in the user's Fits tab immediately on
+        creation; image generation can happen later (lazy / on-demand).
+        """
+        now = datetime.utcnow().isoformat()
+        fit_payload = {
+            "user_id": user_id,
+            "title": title,
+            "source": source,
+            "tags": tags,
+            "items": items,
+            "created_at": now,
+            "updated_at": now,
+        }
+        result = self.supabase.table("user_fits").insert(fit_payload).execute()
+        fit_data = result.data[0]
+        return {
+            "id": fit_data["id"],
+            "user_id": user_id,
+            "title": title,
+            "source": source,
+            "tags": tags,
+            "items": items,
+            "created_at": fit_data.get("created_at"),
+        }
+
     def create_fit_with_images(
         self,
         user_id: str,
