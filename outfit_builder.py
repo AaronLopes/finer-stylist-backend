@@ -36,8 +36,17 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# Product table priority. "chi" = chi-primary/omega-fallback (default).
+# "omega" = omega-primary/chi-fallback. Set via env to switch without deploy.
+_primary = os.getenv("PRIMARY_RPC", "chi").lower()
+if _primary == "omega":
+    RPC_ORDER = [("ff_build_outfit_v3", "omega"), ("ff_build_outfit_chi", "chi")]
+else:
+    RPC_ORDER = [("ff_build_outfit_chi", "chi"), ("ff_build_outfit_v3", "omega")]
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logger.info("Product table priority: %s-primary", RPC_ORDER[0][1])
 
 
 class ColorStrategy(str, Enum):
@@ -358,14 +367,11 @@ class OutfitBuilder:
         slot_name: str,
     ) -> Optional[Dict[str, Any]]:
         """
-        Try chi (743K products) first. If chi returns empty, fall back to
-        omega (21K products, better gender balance). Returns the best item
-        dict with a _source annotation, or None.
+        Try the primary product table first. If it returns empty, fall back
+        to the secondary. Order controlled by PRIMARY_RPC env var.
+        Returns the best item dict with a _source annotation, or None.
         """
-        for rpc_name, label in [
-            ("ff_build_outfit_chi", "chi"),
-            ("ff_build_outfit_v3", "omega"),
-        ]:
+        for rpc_name, label in RPC_ORDER:
             try:
                 result = self.supabase.rpc(rpc_name, rpc_params).execute()
                 if result.data and len(result.data) > 0:
@@ -391,16 +397,13 @@ class OutfitBuilder:
     ) -> List[Dict[str, Any]]:
         """
         Like _query_slot_with_fallback but returns multiple candidates.
-        Tries chi first; if chi returns fewer than desired_n, tops up from omega.
+        Tries primary first; if fewer than desired_n, tops up from secondary.
         Dedupes by product_id.
         """
         seen_ids: set = set()
         all_candidates: List[Dict[str, Any]] = []
 
-        for rpc_name, label in [
-            ("ff_build_outfit_chi", "chi"),
-            ("ff_build_outfit_v3", "omega"),
-        ]:
+        for rpc_name, label in RPC_ORDER:
             if len(all_candidates) >= desired_n:
                 break
             try:
