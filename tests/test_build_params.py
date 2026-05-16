@@ -82,7 +82,7 @@ def test_profile_only_minimalist_date_balanced(builder):
     assert isinstance(params, OutfitParams)
     assert params.gender == "feminine"
     assert params.occasion == "date"
-    assert params.occasion_tags == ["date"]
+    assert "date" in params.occasion_tags
     assert params.budget_min == 0
     assert params.budget_max == 150
     assert params.color_strategy == ColorStrategy.BOLD
@@ -126,7 +126,7 @@ def test_profile_only_cold_weather_brings_avoid_tags(builder):
     assert any(t in params.avoid_tags for t in ("sleeveless", "linen", "summer"))
 
 
-def test_profile_only_dash_occasion_normalized(builder):
+def test_profile_only_dash_occasion_includes_both_forms(builder):
     params = builder.build_params(
         profile={
             "gender": "unisex",
@@ -135,8 +135,9 @@ def test_profile_only_dash_occasion_normalized(builder):
             "budget": "$$",
         }
     )
-    # dashes become underscores in the SQL-bound occasion_tags array
-    assert params.occasion_tags == ["going_out"]
+    # Both hyphenated and underscored forms for tag matching across chi + omega
+    assert "going_out" in params.occasion_tags
+    assert "going-out" in params.occasion_tags
 
 
 def test_profile_empty_yields_safe_defaults(builder):
@@ -250,7 +251,7 @@ def test_today_overlay_event_overrides_profile_occasion(builder):
         },
     )
     assert params.occasion == "work"
-    assert params.occasion_tags == ["work"]
+    assert "work" in params.occasion_tags
 
 
 def test_today_overlay_no_event_keeps_profile_occasion(builder):
@@ -274,17 +275,17 @@ def test_today_overlay_gym_event_applies_override_tags(builder):
     assert "activewear" in params.style_tags
 
 
-def test_today_overlay_with_no_temp_or_event_is_a_noop(builder):
-    profile_only = builder.build_params(
-        profile={"occasion": "date", "weather": ["moderate"], "style": "classic"}
-    )
-    layered = builder.build_params(
-        profile={"occasion": "date", "weather": ["moderate"], "style": "classic"},
+def test_today_overlay_empty_context_applies_fallback_defaults(builder):
+    """Empty today_context triggers fallbacks: moderate weather, city setting."""
+    params = builder.build_params(
+        profile={"occasion": "date", "style": "classic"},
         today_context={},
     )
-    assert profile_only.occasion == layered.occasion
-    assert set(profile_only.style_tags) == set(layered.style_tags)
-    assert set(profile_only.season_tags) == set(layered.season_tags)
+    assert params.occasion == "date"
+    # Moderate weather fallback
+    assert any(t in params.season_tags for t in ("spring", "fall", "all_season"))
+    # City setting fallback (urban, polished, etc.)
+    assert "urban" in params.style_tags
 
 
 # -----------------------------------------------------------------------------
@@ -324,3 +325,144 @@ def test_full_stack_today_wins_over_chat_wins_over_profile(builder, monkeypatch)
     assert "gym" in params.style_tags
     # Chat budget still applies (today doesn't touch budget)
     assert params.budget_max == 250
+
+
+# -----------------------------------------------------------------------------
+# Location classification
+# -----------------------------------------------------------------------------
+
+
+def test_classify_location_uses_cache(builder, monkeypatch):
+    call_count = {"n": 0}
+    original_create = builder.openai.chat.completions.create
+
+    def mock_create(**kwargs):
+        call_count["n"] += 1
+
+        class _Choice:
+            class _Msg:
+                content = "city"
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        return _Resp()
+
+    monkeypatch.setattr(builder.openai.chat.completions, "create", mock_create)
+    OutfitBuilder._location_cache.clear()
+
+    result1 = builder._classify_location("Brooklyn, NY")
+    result2 = builder._classify_location("Brooklyn, NY")
+    assert result1 == "city"
+    assert result2 == "city"
+    assert call_count["n"] == 1  # cached on second call
+
+
+def test_classify_location_fallback_on_error(builder, monkeypatch):
+    monkeypatch.setattr(
+        builder.openai.chat.completions,
+        "create",
+        lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    OutfitBuilder._location_cache.clear()
+    assert builder._classify_location("Unknown Place") == "city"
+
+
+def test_today_context_city_label_adds_setting_tags(builder, monkeypatch):
+    monkeypatch.setattr(
+        OutfitBuilder, "_classify_location", lambda self, label: "beach"
+    )
+    params = builder.build_params(
+        profile={"style": "classic"},
+        today_context={"city_label": "Malibu, CA", "temp_f": 85},
+    )
+    assert "summer" in params.style_tags
+    assert "relaxed" in params.style_tags
+
+
+def test_today_context_no_city_label_defaults_to_city(builder):
+    params = builder.build_params(
+        profile={"style": "classic"},
+        today_context={"temp_f": 70},
+    )
+    assert "urban" in params.style_tags
+
+
+# -----------------------------------------------------------------------------
+# Today fallback defaults
+# -----------------------------------------------------------------------------
+
+
+def test_today_no_temp_defaults_to_moderate(builder):
+    params = builder.build_params(
+        profile={},
+        today_context={},
+    )
+    assert any(t in params.season_tags for t in ("spring", "fall", "all_season"))
+    assert params.avoid_tags == []  # moderate has no avoid tags
+
+
+def test_today_no_event_keeps_occasion(builder):
+    params = builder.build_params(
+        profile={"occasion": "work"},
+        today_context={"temp_f": 65},
+    )
+    assert params.occasion == "work"
+
+
+# -----------------------------------------------------------------------------
+# Masculine gym remap
+# -----------------------------------------------------------------------------
+
+
+def test_build_for_today_masculine_gym_remaps_to_casual(builder, monkeypatch):
+    monkeypatch.setattr(
+        OutfitBuilder,
+        "_build_outfit",
+        lambda self, params, formula: {
+            "params": params,
+            "formula": formula,
+        },
+    )
+    result = builder.build_for_today(
+        profile={"gender": "masculine", "occasion": "gym", "budget": "$$"},
+        today_context={"temp_f": 70, "primary_event": {"title": "Gym"}},
+    )
+    params = result["params"]
+    assert params.occasion == "casual"
+    assert params.gender == "masculine"
+    assert "streetwear" in params.style_tags
+    assert "athletic" in params.style_tags
+
+
+def test_build_for_today_feminine_gym_not_remapped(builder, monkeypatch):
+    monkeypatch.setattr(
+        OutfitBuilder,
+        "_build_outfit",
+        lambda self, params, formula: {
+            "params": params,
+            "formula": formula,
+        },
+    )
+    result = builder.build_for_today(
+        profile={"gender": "feminine", "occasion": "gym", "budget": "$$"},
+        today_context={"temp_f": 70, "primary_event": {"title": "Gym"}},
+    )
+    params = result["params"]
+    assert params.occasion == "gym"
+
+
+# -----------------------------------------------------------------------------
+# Occasion tags: both forms
+# -----------------------------------------------------------------------------
+
+
+def test_occasion_tags_non_hyphenated_dedupes(builder):
+    params = builder.build_params(profile={"occasion": "work"})
+    assert params.occasion_tags == ["work"]
+
+
+def test_occasion_tags_going_out_has_both_forms(builder):
+    params = builder.build_params(profile={"occasion": "going-out"})
+    assert set(params.occasion_tags) == {"going-out", "going_out"}

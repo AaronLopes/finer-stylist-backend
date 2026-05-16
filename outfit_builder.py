@@ -298,10 +298,129 @@ class OutfitBuilder:
     2. Chat mode: Natural language queries
     """
 
+    _location_cache: Dict[str, str] = {}
+
     def __init__(self):
         self.supabase = supabase.create_client(SUPABASE_URL, SUPABASE_KEY)
         self.openai = OpenAI(api_key=OPENAI_API_KEY)
         logger.info("OutfitBuilder initialized")
+
+    # =========================================================================
+    # LOCATION CLASSIFICATION (LLM + cache)
+    # =========================================================================
+
+    def _classify_location(self, city_label: str) -> str:
+        """
+        Classify a city_label (e.g. "Brooklyn, NY") into a SETTING_TAG_MAP key
+        using gpt-4o-mini. Results are cached in-memory per unique city_label.
+        Returns one of: city, suburbs, country, beach.  Falls back to "city".
+        """
+        key = city_label.strip().lower()
+        if key in self._location_cache:
+            return self._location_cache[key]
+
+        valid_settings = ["city", "suburbs", "country", "beach"]
+        try:
+            resp = self.openai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You classify locations for a fashion styling app. "
+                            "Given a location label, respond with exactly one word: "
+                            "city, suburbs, country, or beach. Nothing else."
+                        ),
+                    },
+                    {"role": "user", "content": city_label},
+                ],
+                max_tokens=5,
+                temperature=0,
+            )
+            setting = resp.choices[0].message.content.strip().lower()
+            if setting not in valid_settings:
+                setting = "city"
+        except Exception as e:
+            logger.warning("Location classification failed for '%s': %s", city_label, e)
+            setting = "city"
+
+        self._location_cache[key] = setting
+        logger.info("Classified location '%s' → %s", city_label, setting)
+        return setting
+
+    # =========================================================================
+    # CHI/OMEGA FALLBACK
+    # =========================================================================
+
+    def _query_slot_with_fallback(
+        self,
+        rpc_params: Dict[str, Any],
+        slot_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Try chi (743K products) first. If chi returns empty, fall back to
+        omega (21K products, better gender balance). Returns the best item
+        dict with a _source annotation, or None.
+        """
+        for rpc_name, label in [
+            ("ff_build_outfit_chi", "chi"),
+            ("ff_build_outfit_v3", "omega"),
+        ]:
+            try:
+                result = self.supabase.rpc(rpc_name, rpc_params).execute()
+                if result.data and len(result.data) > 0:
+                    item = result.data[0]
+                    item["_source"] = label
+                    logger.info(
+                        "  ✓ [%s] slot=%s found %d candidates",
+                        label, slot_name, len(result.data),
+                    )
+                    return item
+                logger.info("  ↓ [%s] slot=%s empty, trying next", label, slot_name)
+            except Exception as e:
+                logger.warning(
+                    "  ⚠ [%s] slot=%s RPC error: %s", label, slot_name, e
+                )
+        return None
+
+    def _query_slot_candidates_with_fallback(
+        self,
+        rpc_params: Dict[str, Any],
+        slot_name: str,
+        desired_n: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Like _query_slot_with_fallback but returns multiple candidates.
+        Tries chi first; if chi returns fewer than desired_n, tops up from omega.
+        Dedupes by product_id.
+        """
+        seen_ids: set = set()
+        all_candidates: List[Dict[str, Any]] = []
+
+        for rpc_name, label in [
+            ("ff_build_outfit_chi", "chi"),
+            ("ff_build_outfit_v3", "omega"),
+        ]:
+            if len(all_candidates) >= desired_n:
+                break
+            try:
+                params = {**rpc_params, "p_n": desired_n}
+                result = self.supabase.rpc(rpc_name, params).execute()
+                for item in result.data or []:
+                    pid = item.get("product_id")
+                    if pid not in seen_ids:
+                        seen_ids.add(pid)
+                        item["_source"] = label
+                        all_candidates.append(item)
+            except Exception as e:
+                logger.warning(
+                    "  ⚠ [%s] slot=%s candidates RPC error: %s", label, slot_name, e
+                )
+
+        logger.info(
+            "  slot=%s total candidates=%d", slot_name, len(all_candidates)
+        )
+        return all_candidates
 
     # =========================================================================
     # QUIZ MODE
@@ -465,15 +584,18 @@ class OutfitBuilder:
                 budget_min = 0.0
 
         # ----- Layer 3: today overlay (live signals win) -----
-        if today_context:
+        if today_context is not None:
+            # Weather: live temp wins, fallback to "moderate"
             temp_f = today_context.get("temp_f")
             if temp_f is not None:
                 bucket = _temp_to_weather_bucket(float(temp_f))
-                cfg = WEATHER_TAG_MAP[bucket]
-                # Replace, not append — live weather is authoritative
-                season_tags = list(cfg.get("season_tags", []))
-                avoid_tags = list(cfg.get("avoid_tags", []))
+            else:
+                bucket = "moderate"
+            cfg = WEATHER_TAG_MAP[bucket]
+            season_tags = list(cfg.get("season_tags", []))
+            avoid_tags = list(cfg.get("avoid_tags", []))
 
+            # Occasion: calendar event wins, fallback to "casual"
             inferred_event_occasion = _event_to_occasion(
                 today_context.get("primary_event")
             )
@@ -482,8 +604,18 @@ class OutfitBuilder:
                 if occasion in OCCASION_STYLE_OVERRIDE:
                     style_tags = OCCASION_STYLE_OVERRIDE[occasion].copy()
 
-        # Occasion tag is always derived from the final occasion
-        occasion_tags = [occasion.replace("-", "_")]
+            # Location: LLM classification wins, fallback to "city"
+            city_label = today_context.get("city_label")
+            if city_label:
+                setting = self._classify_location(city_label)
+            else:
+                setting = "city"
+            if setting in SETTING_TAG_MAP:
+                style_tags.extend(SETTING_TAG_MAP[setting])
+
+        # Occasion tags: include both hyphenated and underscored forms
+        occasion_key = occasion.replace("-", "_")
+        occasion_tags = list(set([occasion, occasion_key]))
 
         return OutfitParams(
             gender=gender,
@@ -666,10 +798,11 @@ Only include fields you can confidently extract. Be concise."""
             today_context: {
                 "lat": float | None,
                 "lon": float | None,
-                "temp_f": float | None,
-                "condition": str | None,         # "sunny" / "rainy" / etc.
-                "daypart": str | None,           # "morning" / "afternoon" / "evening"
-                "primary_event": {               # may be None / omitted
+                "temp_f": float | None,            # fallback: moderate
+                "condition": str | None,
+                "daypart": str | None,
+                "city_label": str | None,          # e.g. "Brooklyn, NY" → setting inference
+                "primary_event": {                 # fallback: casual occasion
                     "title": str,
                     "category": str | None,
                     "all_day": bool | None,
@@ -685,6 +818,26 @@ Only include fields you can confidently extract. Be concise."""
             list((today_context or {}).keys()),
         )
         params = self.build_params(profile=profile, today_context=today_context)
+
+        # Masculine gym remap: neither chi nor omega has meaningful masculine
+        # gym inventory. Remap to casual with athletic-casual style tags.
+        if params.gender == "masculine" and params.occasion == "gym":
+            logger.info("build_for_today: remapping masculine gym → casual")
+            params = OutfitParams(
+                gender=params.gender,
+                occasion="casual",
+                budget_min=params.budget_min,
+                budget_max=params.budget_max,
+                style_tags=["streetwear", "fitted", "athletic"],
+                occasion_tags=["casual"],
+                season_tags=params.season_tags,
+                avoid_tags=params.avoid_tags,
+                hero_boost=params.hero_boost,
+                color_strategy=params.color_strategy,
+                boost_affiliates=params.boost_affiliates,
+                affiliate_boost_weight=params.affiliate_boost_weight,
+            )
+
         formula = OCCASION_FORMULAS.get(params.occasion, OCCASION_FORMULAS["casual"])
         return self._build_outfit(params, formula)
 
@@ -752,56 +905,41 @@ Only include fields you can confidently extract. Be concise."""
                 params.occasion,
             )
 
-            # Query ff_build_outfit_v3 for this slot (with affiliate boosting)
-            try:
-                result = self.supabase.rpc(
-                    "ff_build_outfit_v3",
-                    {
-                        "p_slot": slot_config.slot,
-                        "p_gender": params.gender,
-                        "p_min_price": params.budget_min,
-                        "p_max_price": params.budget_max,
-                        "p_style_tags": params.style_tags,
-                        "p_occasion_tags": params.occasion_tags,
-                        "p_season_tags": params.season_tags,
-                        "p_avoid_tags": params.avoid_tags,
-                        "p_target_formality": slot_config.formality,
-                        "p_hero_slot": slot_config.is_hero,
-                        "p_existing_colors": selected_colors,
-                        "p_existing_textures": selected_textures,
-                        "p_color_strategy": params.color_strategy.value,
-                        "p_boost_affiliates": params.boost_affiliates,
-                        "p_affiliate_boost_weight": params.affiliate_boost_weight,
-                        "p_n": 1,  # Get top candidate
-                    },
-                ).execute()
+            rpc_params = {
+                "p_slot": slot_config.slot,
+                "p_gender": params.gender,
+                "p_min_price": params.budget_min,
+                "p_max_price": params.budget_max,
+                "p_style_tags": params.style_tags,
+                "p_occasion_tags": params.occasion_tags,
+                "p_season_tags": params.season_tags,
+                "p_avoid_tags": params.avoid_tags,
+                "p_target_formality": slot_config.formality,
+                "p_hero_slot": slot_config.is_hero,
+                "p_existing_colors": selected_colors,
+                "p_existing_textures": selected_textures,
+                "p_color_strategy": params.color_strategy.value,
+                "p_boost_affiliates": params.boost_affiliates,
+                "p_affiliate_boost_weight": params.affiliate_boost_weight,
+                "p_n": 1,
+            }
 
-                if result.data and len(result.data) > 0:
-                    item = result.data[0]
-                    outfit["items"][slot_config.slot] = item
+            item = self._query_slot_with_fallback(rpc_params, slot_config.slot)
 
-                    # Track selected attributes for next slot
-                    if item.get("product_color"):
-                        selected_colors.append(item["product_color"])
-                    if item.get("product_texture"):
-                        selected_textures.append(item["product_texture"])
-
-                    # Accumulate price
-                    if item.get("product_price_amount"):
-                        outfit["total_price"] += float(item["product_price_amount"])
-
-                    logger.info(
-                        "  ✓ Selected: %s...",
-                        item.get("product_title", "Unknown")[:50],
-                    )
-                else:
-                    logger.warning(
-                        "  ⚠ No products found for slot: %s", slot_config.slot
-                    )
-                    outfit["items"][slot_config.slot] = None
-
-            except Exception as e:
-                logger.error("  ✗ Error querying slot %s: %s", slot_config.slot, e)
+            if item:
+                outfit["items"][slot_config.slot] = item
+                if item.get("product_color"):
+                    selected_colors.append(item["product_color"])
+                if item.get("product_texture"):
+                    selected_textures.append(item["product_texture"])
+                if item.get("product_price_amount"):
+                    outfit["total_price"] += float(item["product_price_amount"])
+                logger.info(
+                    "  ✓ Selected: %s...",
+                    item.get("product_title", "Unknown")[:50],
+                )
+            else:
+                logger.warning("  ⚠ No products found for slot: %s", slot_config.slot)
                 outfit["items"][slot_config.slot] = None
 
         outfit["total_price"] = round(outfit["total_price"], 2)
@@ -856,45 +994,40 @@ Only include fields you can confidently extract. Be concise."""
         if not slot_config:
             slot_config = SlotConfig(slot_to_swap, formality=3, is_hero=False)
 
-        # Query for alternatives
-        try:
-            result = self.supabase.rpc(
-                "ff_build_outfit_v3",
-                {
-                    "p_slot": slot_to_swap,
-                    "p_gender": params_used.get("gender", "unisex"),
-                    "p_style_tags": params_used.get("style_tags", []),
-                    "p_occasion_tags": [occasion.replace("-", "_")],
-                    "p_target_formality": slot_config.formality,
-                    "p_hero_slot": slot_config.is_hero,
-                    "p_existing_colors": existing_colors,
-                    "p_existing_textures": existing_textures,
-                    "p_color_strategy": params_used.get("color_strategy", "balanced"),
-                    "p_boost_affiliates": params_used.get("boost_affiliates", True),
-                    "p_affiliate_boost_weight": params_used.get(
-                        "affiliate_boost_weight", 0.15
-                    ),
-                    "p_n": 5,  # Get multiple to filter
-                },
-            ).execute()
+        occasion_key = occasion.replace("-", "_")
+        occasion_tags = list(set([occasion, occasion_key]))
 
-            # Filter out excluded products
-            exclude_ids = set(exclude_product_ids or [])
-            candidates = [
-                item
-                for item in result.data
-                if item.get("product_id") not in exclude_ids
-            ]
+        rpc_params = {
+            "p_slot": slot_to_swap,
+            "p_gender": params_used.get("gender", "unisex"),
+            "p_style_tags": params_used.get("style_tags", []),
+            "p_occasion_tags": occasion_tags,
+            "p_target_formality": slot_config.formality,
+            "p_hero_slot": slot_config.is_hero,
+            "p_existing_colors": existing_colors,
+            "p_existing_textures": existing_textures,
+            "p_color_strategy": params_used.get("color_strategy", "balanced"),
+            "p_boost_affiliates": params_used.get("boost_affiliates", True),
+            "p_affiliate_boost_weight": params_used.get(
+                "affiliate_boost_weight", 0.15
+            ),
+        }
 
-            if candidates:
-                return candidates[0]
-            elif result.data:
-                return result.data[0]  # Fallback to any result
-            else:
-                return None
+        all_candidates = self._query_slot_candidates_with_fallback(
+            rpc_params, slot_to_swap, desired_n=5,
+        )
 
-        except Exception as e:
-            logger.error("Swap failed: %s", e)
+        exclude_ids = set(exclude_product_ids or [])
+        candidates = [
+            item for item in all_candidates
+            if item.get("product_id") not in exclude_ids
+        ]
+
+        if candidates:
+            return candidates[0]
+        elif all_candidates:
+            return all_candidates[0]
+        else:
             return None
 
 

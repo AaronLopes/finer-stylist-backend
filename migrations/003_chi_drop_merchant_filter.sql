@@ -1,0 +1,7 @@
+-- 003_chi_drop_merchant_filter.sql
+-- Remove merchant_id = '114434' filter from ff_build_outfit_chi so it
+-- searches the full chi catalog (~743K products). The backend now uses
+-- chi as the primary source and falls back to omega when a slot is empty.
+--
+-- Apply: run the updated 004_ff_build_outfit_chi.sql from smart-fashion-backend/sql/
+-- This migration is a reminder — the actual DDL lives in that file.
