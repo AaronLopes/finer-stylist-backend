@@ -948,15 +948,16 @@ def build_outfit_today():
       "today_context": {
         "lat": float | null,
         "lon": float | null,
-        "temp_f": float | null,
+        "temp_f": float | null,             # fallback: "moderate" weather
         "condition": "sunny" | "rainy" | ... | null,
         "daypart": "morning" | "afternoon" | "evening" | null,
-        "primary_event": {                 # null if calendar denied / empty
+        "city_label": str | null,           # e.g. "Brooklyn, NY" → setting inference; fallback: "city"
+        "primary_event": {                  # null → fallback: "casual" occasion
           "title": str,
           "category": str | null,
           "all_day": bool | null
         } | null,
-        "local_date": "YYYY-MM-DD" | null  # iOS-supplied for cache key
+        "local_date": "YYYY-MM-DD" | null   # iOS-supplied for cache key
       }
     }
     """
