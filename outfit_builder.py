@@ -36,13 +36,13 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Product table priority. "chi" = chi-primary/omega-fallback (default).
-# "omega" = omega-primary/chi-fallback. Set via env to switch without deploy.
-_primary = os.getenv("PRIMARY_RPC", "chi").lower()
-if _primary == "omega":
-    RPC_ORDER = [("ff_build_outfit_v3", "omega"), ("ff_build_outfit_chi", "chi")]
-else:
+# Product table priority. "omega" = omega-primary/chi-fallback (default).
+# "chi" = chi-primary/omega-fallback. Set via env to switch without deploy.
+_primary = os.getenv("PRIMARY_RPC", "omega").lower()
+if _primary == "chi":
     RPC_ORDER = [("ff_build_outfit_chi", "chi"), ("ff_build_outfit_v3", "omega")]
+else:
+    RPC_ORDER = [("ff_build_outfit_v3", "omega"), ("ff_build_outfit_chi", "chi")]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
