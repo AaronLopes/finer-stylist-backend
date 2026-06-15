@@ -11,6 +11,7 @@ Endpoints:
     POST /api/outfit/build     - Build outfit from quiz or chat
     POST /api/outfit/swap      - Swap single item in outfit
     POST /api/chat/parse       - Parse chat query (preview what we understood)
+    GET  /products/search      - Semantic product search (iOS Search tab)
     GET  /api/health           - Health check
 
 Usage:
@@ -35,6 +36,7 @@ from flask_cors import CORS
 from chat_service import get_chat_composer, get_chat_resolver
 from fit_image_service import FitImageService
 from outfit_builder import OutfitBuilder, create_outfit_builder
+from product_search_service import ProductSearchService
 
 load_dotenv()
 
@@ -50,6 +52,9 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # Initialize outfit builder (lazy loading)
 _outfit_builder: Optional[OutfitBuilder] = None
 _fit_image_service: Optional[FitImageService] = None
+_product_search_service: Optional[ProductSearchService] = None
+
+MAX_SEARCH_LIMIT = 50
 
 
 def get_outfit_builder() -> OutfitBuilder:
@@ -64,6 +69,13 @@ def get_fit_image_service() -> FitImageService:
     if _fit_image_service is None:
         _fit_image_service = FitImageService()
     return _fit_image_service
+
+
+def get_product_search_service() -> ProductSearchService:
+    global _product_search_service
+    if _product_search_service is None:
+        _product_search_service = ProductSearchService()
+    return _product_search_service
 
 
 def _short_user_id(user_id: Optional[str]) -> str:
@@ -792,6 +804,62 @@ def list_user_fits():
             "Fit listing failed user=%s error=%s", _short_user_id(user_id), e
         )
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/products/search", methods=["GET"])
+def search_products():
+    """
+    Semantic product search over the catalog.
+
+    Backs the iOS Search tab (ProductSearching protocol — see
+    finer-ios docs/backend-blanks.md). Embeds the query with fashionSigLIP
+    and ranks by pgvector cosine similarity via the match_products_semantic
+    RPC.
+
+    Query params:
+      - q (required): natural-language search text
+      - limit (optional, default 20, capped at 50)
+    """
+    query = (request.args.get("q") or "").strip()
+    if not query:
+        logger.warning("/products/search missing q param")
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "results": [],
+                    "error": "Missing required query param: q",
+                }
+            ),
+            400,
+        )
+
+    limit_raw = request.args.get("limit", "20")
+    try:
+        limit = int(limit_raw)
+    except (TypeError, ValueError):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "results": [],
+                    "error": f"Invalid limit: {limit_raw}",
+                }
+            ),
+            400,
+        )
+    limit = max(1, min(limit, MAX_SEARCH_LIMIT))
+
+    logger.info("/products/search q_len=%s limit=%s", len(query), limit)
+
+    try:
+        service = get_product_search_service()
+        results = service.search(query, limit=limit)
+        logger.info("/products/search success result_count=%s", len(results))
+        return jsonify({"success": True, "results": results, "error": None})
+    except Exception as e:
+        logger.exception("/products/search failed q_len=%s error=%s", len(query), e)
+        return jsonify({"success": False, "results": [], "error": str(e)}), 500
 
 
 @app.route("/chat/resolve-intent", methods=["POST"])
