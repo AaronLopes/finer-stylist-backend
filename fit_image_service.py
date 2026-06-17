@@ -37,6 +37,7 @@ class FitImageService:
         items: List[Dict[str, Any]],
         profile: Optional[Dict[str, Any]] = None,
         count: int = 3,
+        selfie_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Generate Gemini images for an EXISTING fit row and attach them.
 
@@ -51,6 +52,7 @@ class FitImageService:
             shoes_image=slots.get("shoes") or "",
             profile=profile or {},
             count=count,
+            selfie_url=selfie_url,
         )
 
         # Touch the fit's updated_at so the Fits list re-orders correctly.
@@ -150,6 +152,7 @@ class FitImageService:
         items: List[Dict[str, Any]],
         profile: Optional[Dict[str, Any]] = None,
         count: int = 3,
+        selfie_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         slots = self._extract_slots(items)
         generated_images = self._generate_images(
@@ -158,6 +161,7 @@ class FitImageService:
             shoes_image=slots.get("shoes") or "",
             profile=profile or {},
             count=count,
+            selfie_url=selfie_url,
         )
 
         fit_payload = {
@@ -276,28 +280,43 @@ class FitImageService:
         shoes_image: str,
         profile: Dict[str, Any],
         count: int,
+        selfie_url: Optional[str] = None,
     ) -> List[bytes]:
         available = [url for url in [top_image, bottom_image, shoes_image] if url]
         if not available:
             raise ValueError("Need at least one image URL to generate fit images")
 
-        image_parts = []
+        # Precision Fit: when a selfie is supplied, load it as the FIRST image
+        # part so the prompt can reference it as the person's face/likeness. If
+        # it fails to load we silently fall back to a generic model.
+        face_part = None
+        if selfie_url:
+            face_inline = self._convert_image_to_inline_data(selfie_url)
+            if face_inline:
+                face_part = {"inlineData": face_inline}
+            else:
+                logger.warning("Selfie load failed; rendering generic model")
+        has_face = face_part is not None
+
+        garment_parts = []
         for url in [top_image, bottom_image, shoes_image]:
             if not url:
                 continue
             inline = self._convert_image_to_inline_data(url)
             if inline:
-                image_parts.append({"inlineData": inline})
+                garment_parts.append({"inlineData": inline})
 
-        if not image_parts:
+        if not garment_parts:
             raise ValueError("Could not load any item images for generation")
+
+        image_parts = ([face_part] if has_face else []) + garment_parts
 
         gender = profile.get("gender") or ""
         style = profile.get("style") or ""
         occasion = profile.get("occasion") or ""
 
         def _call_gemini(variation: int) -> Optional[bytes]:
-            prompt = self._build_prompt(gender, style, occasion, variation)
+            prompt = self._build_prompt(gender, style, occasion, variation, has_face)
             payload = {
                 "contents": [
                     {
@@ -426,14 +445,32 @@ class FitImageService:
         return f"{SUPABASE_URL}/storage/v1{signed_path}"
 
     def _build_prompt(
-        self, gender: str, style: str, occasion: str, variation: int
+        self,
+        gender: str,
+        style: str,
+        occasion: str,
+        variation: int,
+        has_face: bool = False,
     ) -> str:
+        if has_face:
+            intro = (
+                "The FIRST reference image is a selfie of a real person. Create a photorealistic "
+                "full-body fashion image of THIS SAME PERSON — their face, skin tone, and likeness "
+                "must closely and faithfully match the selfie. Dress them in the outfit items shown "
+                "in the REMAINING reference images. "
+            )
+        else:
+            intro = (
+                "Create a photorealistic full-body fashion model image featuring the outfit items "
+                "provided in the reference images. "
+            )
         return (
-            "Create a photorealistic full-body fashion model image featuring the outfit items provided in the reference images. "
-            "Preserve garment details, silhouettes, and colors accurately. "
+            intro
+            + "Preserve garment details, silhouettes, and colors accurately. "
             f"Gender expression: {gender or 'unspecified'}. "
             f"Style: {style or 'modern'}. "
             f"Occasion: {occasion or 'everyday'}. "
-            f"Variation {variation}: use a different model pose and background while keeping the same outfit pieces. "
-            "Output only one image."
+            f"Variation {variation}: use a different pose and background while keeping the same outfit pieces"
+            + (" and the same person's face" if has_face else "")
+            + ". Output only one image."
         )

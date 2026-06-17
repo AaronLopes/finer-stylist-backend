@@ -705,6 +705,9 @@ def generate_fit_images():
     service = get_fit_image_service()
     source = data.get("source") or "stylist_chat"
     existing_fit_id = data.get("fit_id")
+    # Optional Precision Fit likeness reference (Pro). When present, the model is
+    # rendered with the user's own face instead of a generic model.
+    selfie_url = data.get("selfie_url") or None
 
     try:
         if existing_fit_id:
@@ -715,6 +718,7 @@ def generate_fit_images():
                 items=items,
                 profile=profile,
                 count=int(data.get("count") or 3),
+                selfie_url=selfie_url,
             )
         else:
             result = service.create_fit_with_images(
@@ -725,6 +729,7 @@ def generate_fit_images():
                 items=items,
                 profile=profile,
                 count=int(data.get("count") or 3),
+                selfie_url=selfie_url,
             )
 
         logger.info(
