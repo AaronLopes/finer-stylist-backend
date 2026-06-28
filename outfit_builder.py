@@ -22,9 +22,10 @@ Usage:
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Set
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -61,7 +62,7 @@ class OutfitParams:
     """Unified parameters for outfit building - used by both quiz and chat modes."""
 
     # Core filters
-    gender: str  # masculine, feminine, unisex, non-binary
+    gender: str  # masculine, feminine, genderless
     occasion: str  # date, work, casual, going-out, gym
     budget_min: float = 0
     budget_max: float = 10000
@@ -71,6 +72,8 @@ class OutfitParams:
     occasion_tags: List[str] = field(default_factory=list)
     season_tags: List[str] = field(default_factory=list)
     avoid_tags: List[str] = field(default_factory=list)
+    category_includes: Dict[str, List[str]] = field(default_factory=dict)
+    category_excludes: Dict[str, List[str]] = field(default_factory=dict)
 
     # Stylist modifiers
     hero_boost: float = 1.0  # 1.5 for "serve-looks"
@@ -88,6 +91,8 @@ class SlotConfig:
     slot: str  # top, bottom, footwear, outerwear, accessory
     formality: int  # 1-5
     is_hero: bool = False
+    include_categories: Optional[List[str]] = None
+    exclude_categories: Optional[List[str]] = None
 
 
 @dataclass
@@ -147,6 +152,225 @@ OCCASION_FORMULAS: Dict[str, OutfitFormula] = {
         balance_rule="match",
     ),
 }
+
+VALID_CATEGORIES_BY_SLOT: Dict[str, List[str]] = {
+    "top": [
+        "t_shirt",
+        "shirt",
+        "blouse",
+        "tank_top",
+        "sweater",
+        "sweatshirt_hoodie",
+        "polo",
+        "bodysuit",
+        "dress",
+        "jumpsuit_romper",
+        "top_other",
+    ],
+    "bottom": [
+        "pants",
+        "jeans",
+        "shorts",
+        "skirt_skort",
+        "leggings",
+        "underwear",
+        "bottom_other",
+    ],
+    "footwear": [
+        "sneaker",
+        "boot",
+        "sandal",
+        "heel",
+        "loafer_flat",
+        "footwear_other",
+    ],
+    "outerwear": ["jacket", "coat", "blazer", "cardigan", "vest", "outerwear_other"],
+    "accessory": [
+        "bag",
+        "jewelry",
+        "hat",
+        "belt",
+        "scarf",
+        "eyewear",
+        "watch",
+        "accessory_other",
+    ],
+}
+
+DEFAULT_EXCLUDE_CATEGORIES_BY_SLOT: Dict[str, List[str]] = {
+    "top": ["dress", "jumpsuit_romper"],
+    "bottom": ["underwear"],
+}
+
+OCCASION_CATEGORY_TIERS: Dict[str, Dict[str, List[List[str]]]] = {
+    "work": {
+        "top": [
+            ["shirt", "blouse", "sweater", "polo"],
+            ["shirt", "blouse", "sweater", "polo", "t_shirt"],
+        ],
+        "bottom": [["pants"], ["pants", "skirt_skort", "jeans"]],
+        "footwear": [
+            ["loafer_flat", "boot", "heel"],
+            ["loafer_flat", "boot", "heel", "sneaker"],
+        ],
+    },
+    "date": {
+        "top": [
+            ["blouse", "shirt", "sweater", "bodysuit"],
+            ["blouse", "shirt", "sweater", "bodysuit", "tank_top", "t_shirt"],
+        ],
+        "bottom": [
+            ["jeans", "skirt_skort", "pants"],
+            ["jeans", "skirt_skort", "pants", "shorts"],
+        ],
+        "footwear": [
+            ["heel", "boot", "loafer_flat", "sandal"],
+            ["heel", "boot", "loafer_flat", "sandal", "sneaker"],
+        ],
+    },
+    "going-out": {
+        "top": [
+            ["blouse", "bodysuit", "tank_top", "shirt"],
+            ["blouse", "bodysuit", "tank_top", "shirt", "sweater"],
+        ],
+        "bottom": [
+            ["pants", "skirt_skort", "jeans"],
+            ["pants", "skirt_skort", "jeans", "shorts"],
+        ],
+        "footwear": [
+            ["heel", "boot", "loafer_flat"],
+            ["heel", "boot", "loafer_flat", "sandal"],
+        ],
+    },
+    "gym": {
+        "top": [
+            ["t_shirt", "tank_top", "sweatshirt_hoodie"],
+            ["t_shirt", "tank_top", "sweatshirt_hoodie", "top_other"],
+        ],
+        "bottom": [
+            ["leggings", "shorts", "pants"],
+            ["leggings", "shorts", "pants", "bottom_other"],
+        ],
+        "footwear": [["sneaker"], ["sneaker", "footwear_other"]],
+    },
+    "casual": {
+        "top": [
+            ["t_shirt", "shirt", "sweater", "sweatshirt_hoodie"],
+            [
+                "t_shirt",
+                "shirt",
+                "sweater",
+                "sweatshirt_hoodie",
+                "tank_top",
+                "polo",
+                "blouse",
+            ],
+        ],
+        "bottom": [
+            ["jeans", "pants", "shorts", "leggings"],
+            ["jeans", "pants", "shorts", "leggings", "skirt_skort"],
+        ],
+        "footwear": [
+            ["sneaker", "boot", "sandal", "loafer_flat"],
+            ["sneaker", "boot", "sandal", "loafer_flat", "footwear_other"],
+        ],
+    },
+}
+
+CHAT_CATEGORY_ALIASES: Dict[str, Dict[str, List[str]]] = {
+    "top": {
+        "t_shirt": [r"\btees?\b", r"\bt-?shirts?\b"],
+        "shirt": [r"\bshirts?\b", r"\bbutton[-\s]?downs?\b"],
+        "blouse": [r"\bblouses?\b"],
+        "tank_top": [r"\btanks?\b", r"\btank tops?\b"],
+        "sweater": [r"\bsweaters?\b", r"\bknits?\b"],
+        "sweatshirt_hoodie": [r"\bhoodies?\b", r"\bsweatshirts?\b"],
+        "polo": [r"\bpolos?\b"],
+        "bodysuit": [r"\bbodysuits?\b"],
+    },
+    "bottom": {
+        "pants": [r"\bpants?\b", r"\btrousers?\b", r"\bslacks?\b", r"\bchinos?\b"],
+        "jeans": [r"\bjeans?\b", r"\bdenim\b"],
+        "shorts": [r"\bshorts?\b"],
+        "skirt_skort": [r"\bskirts?\b", r"\bskorts?\b"],
+        "leggings": [r"\bleggings?\b"],
+    },
+    "footwear": {
+        "sneaker": [r"\bsneakers?\b", r"\btennis shoes?\b"],
+        "boot": [r"\bboots?\b"],
+        "sandal": [r"\bsandals?\b"],
+        "heel": [r"\bheels?\b"],
+        "loafer_flat": [r"\bloafers?\b", r"\bflats?\b"],
+    },
+}
+
+SLOT_CANDIDATE_POOL_SIZE = 8
+
+UNDERWEAR_RE = re.compile(
+    r"\b(underwear|boxer\s*briefs?|boxers?|briefs?|panties|bras?|bralettes?|"
+    r"lingerie|thongs?|knickers?)\b",
+    re.I,
+)
+
+
+def _normalize_gender(value: Optional[str]) -> str:
+    gender = (value or "").strip().lower()
+    if gender in {"masculine", "feminine"}:
+        return gender
+    if gender in {"genderless", "unisex", "non-binary", "nonbinary", ""}:
+        return "genderless"
+    return "genderless"
+
+
+def _rpc_gender(value: Optional[str]) -> Optional[str]:
+    gender = _normalize_gender(value)
+    return None if gender == "genderless" else gender
+
+
+def _dedupe_lower(values: Optional[List[str]]) -> List[str]:
+    seen: Set[str] = set()
+    result: List[str] = []
+    for value in values or []:
+        normalized = str(value or "").strip().lower()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
+
+
+def _valid_categories_for_slot(slot: str, categories: Optional[List[str]]) -> List[str]:
+    valid = set(VALID_CATEGORIES_BY_SLOT.get(slot, []))
+    return [cat for cat in _dedupe_lower(categories) if cat in valid]
+
+
+def _sanitize_category_map(value: Any) -> Dict[str, List[str]]:
+    if not isinstance(value, dict):
+        return {}
+    sanitized: Dict[str, List[str]] = {}
+    for slot, categories in value.items():
+        slot_key = str(slot or "").strip().lower()
+        if slot_key not in VALID_CATEGORIES_BY_SLOT:
+            continue
+        if isinstance(categories, str):
+            raw_categories = [categories]
+        elif isinstance(categories, list):
+            raw_categories = categories
+        else:
+            continue
+        valid_categories = _valid_categories_for_slot(slot_key, raw_categories)
+        if valid_categories:
+            sanitized[slot_key] = valid_categories
+    return sanitized
+
+
+def _merge_category_maps(*maps: Any) -> Dict[str, List[str]]:
+    merged: Dict[str, List[str]] = {}
+    for category_map in maps:
+        for slot, categories in _sanitize_category_map(category_map).items():
+            merged[slot] = _valid_categories_for_slot(
+                slot, [*merged.get(slot, []), *categories]
+            )
+    return {slot: categories for slot, categories in merged.items() if categories}
 
 # Setting → Tag modifiers
 # NOTE: Avoid "casual" - 72% of products have it, making it meaningless noise
@@ -361,27 +585,155 @@ class OutfitBuilder:
     # CHI/OMEGA FALLBACK
     # =========================================================================
 
+    @staticmethod
+    def _category_filters(slot_config: SlotConfig) -> Dict[str, Optional[List[str]]]:
+        include = _valid_categories_for_slot(
+            slot_config.slot, slot_config.include_categories
+        )
+        hard_excludes = DEFAULT_EXCLUDE_CATEGORIES_BY_SLOT.get(slot_config.slot, [])
+        exclude = _valid_categories_for_slot(
+            slot_config.slot, [*hard_excludes, *(slot_config.exclude_categories or [])]
+        )
+        return {"include": include or None, "exclude": exclude}
+
+    @staticmethod
+    def _slot_category_attempts(
+        params: OutfitParams, slot_config: SlotConfig
+    ) -> List[SlotConfig]:
+        slot = slot_config.slot
+        slot_excludes = _valid_categories_for_slot(
+            slot,
+            [
+                *(slot_config.exclude_categories or []),
+                *params.category_excludes.get(slot, []),
+            ],
+        )
+
+        explicit_include = _valid_categories_for_slot(
+            slot, slot_config.include_categories
+        )
+        chat_include = _valid_categories_for_slot(
+            slot, params.category_includes.get(slot, [])
+        )
+        if explicit_include:
+            include_tiers = [explicit_include]
+        elif chat_include:
+            include_tiers = [chat_include]
+        else:
+            include_tiers = OCCASION_CATEGORY_TIERS.get(
+                params.occasion, OCCASION_CATEGORY_TIERS["casual"]
+            ).get(slot, [])
+
+        attempts: List[SlotConfig] = []
+        seen: Set[tuple] = set()
+        for include in include_tiers:
+            valid_include = _valid_categories_for_slot(slot, include)
+            if not valid_include:
+                continue
+            key = tuple(valid_include)
+            if key in seen:
+                continue
+            seen.add(key)
+            attempts.append(
+                SlotConfig(
+                    slot=slot,
+                    formality=slot_config.formality,
+                    is_hero=slot_config.is_hero,
+                    include_categories=valid_include,
+                    exclude_categories=slot_excludes,
+                )
+            )
+
+        attempts.append(
+            SlotConfig(
+                slot=slot,
+                formality=slot_config.formality,
+                is_hero=slot_config.is_hero,
+                include_categories=None,
+                exclude_categories=slot_excludes,
+            )
+        )
+        return attempts
+
+    @staticmethod
+    def _rpc_params_for_name(
+        rpc_name: str, rpc_params: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if rpc_name == "ff_build_outfit_v3":
+            return rpc_params
+        return {
+            k: v
+            for k, v in rpc_params.items()
+            if k not in {"p_include_categories", "p_exclude_categories"}
+        }
+
+    @staticmethod
+    def _candidate_category(item: Dict[str, Any]) -> Optional[str]:
+        category = (item.get("product_category") or item.get("category") or "").lower()
+        if category:
+            return category
+        text_parts = [item.get("product_title") or "", item.get("product_description") or ""]
+        tags = item.get("product_tags") or []
+        if isinstance(tags, list):
+            text_parts.extend(str(t) for t in tags)
+        else:
+            text_parts.append(str(tags))
+        if UNDERWEAR_RE.search(" ".join(text_parts)):
+            return "underwear"
+        return None
+
+    def _candidate_allowed_for_slot(
+        self, item: Dict[str, Any], slot_config: SlotConfig
+    ) -> bool:
+        filters = self._category_filters(slot_config)
+        category = self._candidate_category(item)
+        include = [c.lower() for c in filters["include"] or []]
+        exclude = [c.lower() for c in filters["exclude"] or []]
+        if include and category not in include:
+            return False
+        if category in exclude:
+            logger.info(
+                "  ↓ rejected slot=%s category=%s title=%s",
+                slot_config.slot,
+                category,
+                (item.get("product_title") or "Unknown")[:50],
+            )
+            return False
+        return True
+
     def _query_slot_with_fallback(
         self,
         rpc_params: Dict[str, Any],
         slot_name: str,
+        slot_config: Optional[SlotConfig] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Try the primary product table first. If it returns empty, fall back
         to the secondary. Order controlled by PRIMARY_RPC env var.
         Returns the best item dict with a _source annotation, or None.
         """
+        slot_config = slot_config or SlotConfig(slot_name, formality=3)
+        category_filters = self._category_filters(slot_config)
+        query_params = dict(rpc_params)
+        if category_filters["include"] or category_filters["exclude"]:
+            query_params["p_n"] = max(
+                int(query_params.get("p_n") or 1), SLOT_CANDIDATE_POOL_SIZE
+            )
         for rpc_name, label in RPC_ORDER:
             try:
-                result = self.supabase.rpc(rpc_name, rpc_params).execute()
+                result = self.supabase.rpc(
+                    rpc_name, self._rpc_params_for_name(rpc_name, query_params)
+                ).execute()
                 if result.data and len(result.data) > 0:
-                    item = result.data[0]
-                    item["_source"] = label
-                    logger.info(
-                        "  ✓ [%s] slot=%s found %d candidates",
-                        label, slot_name, len(result.data),
-                    )
-                    return item
+                    for item in result.data:
+                        if not self._candidate_allowed_for_slot(item, slot_config):
+                            continue
+                        item["_source"] = label
+                        logger.info(
+                            "  ✓ [%s] slot=%s found %d candidates",
+                            label, slot_name, len(result.data),
+                        )
+                        return item
                 logger.info("  ↓ [%s] slot=%s empty, trying next", label, slot_name)
             except Exception as e:
                 logger.warning(
@@ -394,12 +746,14 @@ class OutfitBuilder:
         rpc_params: Dict[str, Any],
         slot_name: str,
         desired_n: int = 5,
+        slot_config: Optional[SlotConfig] = None,
     ) -> List[Dict[str, Any]]:
         """
         Like _query_slot_with_fallback but returns multiple candidates.
         Tries primary first; if fewer than desired_n, tops up from secondary.
         Dedupes by product_id.
         """
+        slot_config = slot_config or SlotConfig(slot_name, formality=3)
         seen_ids: set = set()
         all_candidates: List[Dict[str, Any]] = []
 
@@ -408,8 +762,12 @@ class OutfitBuilder:
                 break
             try:
                 params = {**rpc_params, "p_n": desired_n}
-                result = self.supabase.rpc(rpc_name, params).execute()
+                result = self.supabase.rpc(
+                    rpc_name, self._rpc_params_for_name(rpc_name, params)
+                ).execute()
                 for item in result.data or []:
+                    if not self._candidate_allowed_for_slot(item, slot_config):
+                        continue
                     pid = item.get("product_id")
                     if pid not in seen_ids:
                         seen_ids.add(pid)
@@ -482,11 +840,13 @@ class OutfitBuilder:
         """
 
         # Defaults
-        gender = "unisex"
+        gender = "genderless"
         occasion = "casual"
         style_tags: List[str] = []
         season_tags: List[str] = []
         avoid_tags: List[str] = []
+        category_includes: Dict[str, List[str]] = {}
+        category_excludes: Dict[str, List[str]] = {}
         budget_min = 0.0
         budget_max = 10000.0
         hero_boost = 1.0
@@ -497,13 +857,13 @@ class OutfitBuilder:
         # ----- Layer 1: profile (quiz logic) -----
         if profile:
             if profile.get("gender"):
-                gender = profile["gender"]
+                gender = _normalize_gender(profile["gender"])
                 logger.info(
                     "build_params layer=profile set gender=%s", gender
                 )
             else:
                 logger.info(
-                    "build_params layer=profile gender=MISSING — defaulting to 'unisex' (returns mixed-gender items)"
+                    "build_params layer=profile gender=MISSING — defaulting to 'genderless' (no gender filter)"
                 )
             if profile.get("occasion"):
                 occasion = profile["occasion"]
@@ -555,7 +915,7 @@ class OutfitBuilder:
                     gender,
                     chat_extract["gender"],
                 )
-                gender = chat_extract["gender"]
+                gender = _normalize_gender(chat_extract["gender"])
 
             if chat_extract.get("occasion"):
                 occasion = chat_extract["occasion"]
@@ -585,6 +945,13 @@ class OutfitBuilder:
             if chat_extract.get("budget_max"):
                 budget_max = float(chat_extract["budget_max"])
                 budget_min = 0.0
+
+            category_includes = _sanitize_category_map(
+                chat_extract.get("category_includes")
+            )
+            category_excludes = _sanitize_category_map(
+                chat_extract.get("category_excludes")
+            )
 
         # ----- Layer 3: today overlay (live signals win) -----
         if today_context is not None:
@@ -629,6 +996,8 @@ class OutfitBuilder:
             occasion_tags=occasion_tags,
             season_tags=list(dict.fromkeys(season_tags)),
             avoid_tags=list(dict.fromkeys(avoid_tags)),
+            category_includes=category_includes,
+            category_excludes=category_excludes,
             hero_boost=hero_boost,
             color_strategy=color_strategy,
             boost_affiliates=boost_affiliates,
@@ -707,7 +1076,7 @@ Return a JSON object with these fields:
 - style_descriptors: list of style words from the query (e.g., ["flowy", "romantic", "edgy"])
 - budget_max: number or null (extract from phrases like "under $200")
 - weather_hint: one of [hot, moderate, cold] or null
-- gender: one of [masculine, feminine, unisex] or null (only if explicitly mentioned)
+- gender: one of [masculine, feminine, genderless] or null (only if explicitly mentioned)
 - setting_hint: one of [city, country, suburbs, beach, night-out] or null
 
 Only include fields you can confidently extract. Be concise."""
@@ -723,10 +1092,13 @@ Only include fields you can confidently extract. Be concise."""
                 max_tokens=200,
             )
             extracted = json.loads(response.choices[0].message.content)
-            logger.info("Extracted from query (intent=%s): %s", intent, extracted)
         except Exception as e:
             logger.error("Failed to parse query: %s", e)
             extracted = {}
+
+        # Snapshot exactly what GPT-4o-mini returned, before any fallback edits,
+        # so the breakdown log can show LLM output vs. fallback separately.
+        gpt_extracted = dict(extracted)
 
         # Keyword inference is a *fallback* when the LLM didn't return an
         # occasion — never an override.
@@ -735,7 +1107,77 @@ Only include fields you can confidently extract. Be concise."""
             if inferred and inferred != "casual":
                 extracted["occasion"] = inferred
 
-        return self.build_params(profile=user_profile, chat_extract=extracted)
+        category_intent = self._extract_category_intent(query)
+        extracted["category_includes"] = _merge_category_maps(
+            extracted.get("category_includes"), category_intent["category_includes"]
+        )
+        extracted["category_excludes"] = _merge_category_maps(
+            extracted.get("category_excludes"), category_intent["category_excludes"]
+        )
+
+        if gpt_extracted.get("occasion"):
+            occasion_source = "gpt-4o-mini"
+        elif extracted.get("occasion"):
+            occasion_source = "keyword fallback"
+        else:
+            occasion_source = "default -> casual"
+
+        params = self.build_params(profile=user_profile, chat_extract=extracted)
+
+        # ─── Visibility: how this chat query decomposed into the RPC request ───
+        # Printed to the backend terminal on every chat build so you can see the
+        # full in-between (raw GPT extraction + fallbacks + final scored params).
+        logger.info(
+            "\n"
+            "════════════════ CHAT QUERY BREAKDOWN ════════════════\n"
+            "  query             : %r\n"
+            "  intent            : %s\n"
+            "  user_profile in   : %s\n"
+            "  ── GPT-4o-mini extracted from query ──\n"
+            "  occasion          : %s\n"
+            "  style_descriptors : %s\n"
+            "  budget_max        : %s\n"
+            "  weather_hint      : %s\n"
+            "  gender            : %s\n"
+            "  setting_hint      : %s\n"
+            "  category_includes : %s\n"
+            "  category_excludes : %s\n"
+            "  occasion source   : %s\n"
+            "  ── final params → Supabase RPC (%s) ──\n"
+            "  gender            : %s\n"
+            "  occasion          : %s\n"
+            "  budget            : $%.0f – $%.0f\n"
+            "  style_tags        : %s\n"
+            "  occasion_tags     : %s\n"
+            "  season_tags       : %s\n"
+            "  avoid_tags        : %s\n"
+            "  color_strategy    : %s\n"
+            "═══════════════════════════════════════════════════════",
+            query,
+            intent,
+            user_profile or {},
+            gpt_extracted.get("occasion"),
+            gpt_extracted.get("style_descriptors"),
+            gpt_extracted.get("budget_max"),
+            gpt_extracted.get("weather_hint"),
+            gpt_extracted.get("gender"),
+            gpt_extracted.get("setting_hint"),
+            extracted.get("category_includes"),
+            extracted.get("category_excludes"),
+            occasion_source,
+            RPC_ORDER[0][0],
+            params.gender,
+            params.occasion,
+            params.budget_min,
+            params.budget_max,
+            params.style_tags,
+            params.occasion_tags,
+            params.season_tags,
+            params.avoid_tags,
+            params.color_strategy.value,
+        )
+
+        return params
 
     def _match_tags_by_embedding(self, descriptors: List[str]) -> List[str]:
         """
@@ -835,6 +1277,8 @@ Only include fields you can confidently extract. Be concise."""
                 occasion_tags=["casual"],
                 season_tags=params.season_tags,
                 avoid_tags=params.avoid_tags,
+                category_includes=params.category_includes,
+                category_excludes=params.category_excludes,
                 hero_boost=params.hero_boost,
                 color_strategy=params.color_strategy,
                 boost_affiliates=params.boost_affiliates,
@@ -869,6 +1313,37 @@ Only include fields you can confidently extract. Be concise."""
             return "gym"
 
         return "casual"
+
+    @staticmethod
+    def _extract_category_intent(query: str) -> Dict[str, Dict[str, List[str]]]:
+        """Infer simple slot/category directives from stylist chat text."""
+        query_lower = (query or "").lower()
+        includes: Dict[str, List[str]] = {}
+        excludes: Dict[str, List[str]] = {}
+
+        for slot, category_aliases in CHAT_CATEGORY_ALIASES.items():
+            for category, patterns in category_aliases.items():
+                mentioned = False
+                negated = False
+                for pattern in patterns:
+                    if re.search(pattern, query_lower):
+                        mentioned = True
+                    negation_pattern = (
+                        r"(?:\bno\b|\bwithout\b|\bavoid\b|\bskip\b|\bnot\b|"
+                        r"\bdon'?t want\b|\bdo not want\b|\bnever\b)"
+                        rf"\s+(?:\w+\s+){{0,3}}{pattern}"
+                    )
+                    if re.search(negation_pattern, query_lower):
+                        negated = True
+                if negated:
+                    excludes.setdefault(slot, []).append(category)
+                elif mentioned:
+                    includes.setdefault(slot, []).append(category)
+
+        return {
+            "category_includes": _sanitize_category_map(includes),
+            "category_excludes": _sanitize_category_map(excludes),
+        }
 
     # =========================================================================
     # CORE OUTFIT BUILDING
@@ -907,27 +1382,45 @@ Only include fields you can confidently extract. Be concise."""
                 params.gender,
                 params.occasion,
             )
+            item: Optional[Dict[str, Any]] = None
+            for attempt_index, attempt_config in enumerate(
+                self._slot_category_attempts(params, slot_config), start=1
+            ):
+                category_filters = self._category_filters(attempt_config)
+                logger.info(
+                    "  category attempt %d slot=%s include=%s exclude=%s",
+                    attempt_index,
+                    slot_config.slot,
+                    category_filters["include"],
+                    category_filters["exclude"],
+                )
 
-            rpc_params = {
-                "p_slot": slot_config.slot,
-                "p_gender": params.gender,
-                "p_min_price": params.budget_min,
-                "p_max_price": params.budget_max,
-                "p_style_tags": params.style_tags,
-                "p_occasion_tags": params.occasion_tags,
-                "p_season_tags": params.season_tags,
-                "p_avoid_tags": params.avoid_tags,
-                "p_target_formality": slot_config.formality,
-                "p_hero_slot": slot_config.is_hero,
-                "p_existing_colors": selected_colors,
-                "p_existing_textures": selected_textures,
-                "p_color_strategy": params.color_strategy.value,
-                "p_boost_affiliates": params.boost_affiliates,
-                "p_affiliate_boost_weight": params.affiliate_boost_weight,
-                "p_n": 1,
-            }
+                rpc_params = {
+                    "p_slot": slot_config.slot,
+                    "p_gender": _rpc_gender(params.gender),
+                    "p_min_price": params.budget_min,
+                    "p_max_price": params.budget_max,
+                    "p_style_tags": params.style_tags,
+                    "p_occasion_tags": params.occasion_tags,
+                    "p_season_tags": params.season_tags,
+                    "p_avoid_tags": params.avoid_tags,
+                    "p_target_formality": slot_config.formality,
+                    "p_hero_slot": slot_config.is_hero,
+                    "p_existing_colors": selected_colors,
+                    "p_existing_textures": selected_textures,
+                    "p_color_strategy": params.color_strategy.value,
+                    "p_boost_affiliates": params.boost_affiliates,
+                    "p_affiliate_boost_weight": params.affiliate_boost_weight,
+                    "p_include_categories": category_filters["include"],
+                    "p_exclude_categories": category_filters["exclude"],
+                    "p_n": 1,
+                }
 
-            item = self._query_slot_with_fallback(rpc_params, slot_config.slot)
+                item = self._query_slot_with_fallback(
+                    rpc_params, slot_config.slot, slot_config=attempt_config
+                )
+                if item:
+                    break
 
             if item:
                 outfit["items"][slot_config.slot] = item
@@ -999,10 +1492,11 @@ Only include fields you can confidently extract. Be concise."""
 
         occasion_key = occasion.replace("-", "_")
         occasion_tags = list(set([occasion, occasion_key]))
+        category_filters = self._category_filters(slot_config)
 
         rpc_params = {
             "p_slot": slot_to_swap,
-            "p_gender": params_used.get("gender", "unisex"),
+            "p_gender": _rpc_gender(params_used.get("gender", "genderless")),
             "p_style_tags": params_used.get("style_tags", []),
             "p_occasion_tags": occasion_tags,
             "p_target_formality": slot_config.formality,
@@ -1014,10 +1508,12 @@ Only include fields you can confidently extract. Be concise."""
             "p_affiliate_boost_weight": params_used.get(
                 "affiliate_boost_weight", 0.15
             ),
+            "p_include_categories": category_filters["include"],
+            "p_exclude_categories": category_filters["exclude"],
         }
 
         all_candidates = self._query_slot_candidates_with_fallback(
-            rpc_params, slot_to_swap, desired_n=5,
+            rpc_params, slot_to_swap, desired_n=5, slot_config=slot_config,
         )
 
         exclude_ids = set(exclude_product_ids or [])

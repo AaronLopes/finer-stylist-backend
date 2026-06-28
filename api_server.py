@@ -33,12 +33,14 @@ from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+# Load environment variables before importing service modules, since some of
+# them (e.g. fit_image_service) read env vars at module-import time.
+load_dotenv()
+
 from chat_service import get_chat_composer, get_chat_resolver
 from fit_image_service import FitImageService
 from outfit_builder import OutfitBuilder, create_outfit_builder
 from product_search_service import ProductSearchService
-
-load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

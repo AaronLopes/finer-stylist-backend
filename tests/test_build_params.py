@@ -135,6 +135,7 @@ def test_profile_only_dash_occasion_includes_both_forms(builder):
             "budget": "$$",
         }
     )
+    assert params.gender == "genderless"
     # Both hyphenated and underscored forms for tag matching across chi + omega
     assert "going_out" in params.occasion_tags
     assert "going-out" in params.occasion_tags
@@ -142,7 +143,7 @@ def test_profile_only_dash_occasion_includes_both_forms(builder):
 
 def test_profile_empty_yields_safe_defaults(builder):
     params = builder.build_params(profile={})
-    assert params.gender == "unisex"
+    assert params.gender == "genderless"
     assert params.occasion == "casual"
     assert params.color_strategy == ColorStrategy.BALANCED
     assert params.budget_min == 0
