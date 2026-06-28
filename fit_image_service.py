@@ -243,9 +243,11 @@ class FitImageService:
         normalized: List[Dict[str, Any]] = []
         for fit in fits:
             fit_images = images_by_fit.get(fit["id"], [])
-            image_urls = [
-                self._create_signed_url(img["image_path"]) for img in fit_images
-            ]
+            image_urls: List[str] = []
+            for img in fit_images:
+                signed_url = self._create_signed_url_for_listing(img["image_path"])
+                if signed_url:
+                    image_urls.append(signed_url)
             normalized.append(
                 {
                     "id": fit["id"],
@@ -260,6 +262,17 @@ class FitImageService:
             )
 
         return normalized
+
+    def _create_signed_url_for_listing(self, image_path: str) -> Optional[str]:
+        try:
+            return self._create_signed_url(image_path)
+        except Exception as exc:
+            logger.warning(
+                "Skipping fit image signed URL path=%s error=%s",
+                image_path,
+                exc,
+            )
+            return None
 
     def _extract_slots(self, items: List[Dict[str, Any]]) -> Dict[str, str]:
         slots: Dict[str, str] = {}
