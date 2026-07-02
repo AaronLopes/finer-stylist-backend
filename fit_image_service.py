@@ -20,6 +20,17 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 FIT_IMAGES_BUCKET = os.getenv("FIT_IMAGES_BUCKET", "fit-images-private")
 SIGNED_URL_TTL_SECONDS = int(os.getenv("FIT_SIGNED_URL_TTL_SECONDS", "604800"))
+# Public bucket for shared style personas (see migrations/006_personas.sql).
+PERSONAS_BUCKET = os.getenv("PERSONAS_BUCKET", "personas")
+
+# Curated display names per style aesthetic for the persona card.
+_PERSONA_TITLES = {
+    "minimalist": "The Minimalist",
+    "classic": "The Classic",
+    "fitted": "The Trendsetter",
+    "smart-casual": "The Effortless",
+    "bohemian": "The Free Spirit",
+}
 
 
 class FitImageService:
@@ -213,6 +224,127 @@ class FitImageService:
             },
             "image_urls": image_urls,
         }
+
+    # ------------------------------------------------------------------
+    # Style personas (shared, combination-keyed cache)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def persona_key(profile: Dict[str, Any]) -> str:
+        """Coarse cache key from the visually dominant quiz axes.
+
+        gender|style|occasion|setting, lowercased. Missing axes fall back to
+        "any" so the key is always well-formed. MUST stay in sync with the
+        client-side key in StyleProfile.personaKey (iOS).
+        """
+
+        def norm(value: Any) -> str:
+            text = str(value or "").strip().lower()
+            return text or "any"
+
+        return "|".join(
+            [
+                norm(profile.get("gender")),
+                norm(profile.get("style")),
+                norm(profile.get("occasion")),
+                norm(profile.get("setting")),
+            ]
+        )
+
+    def get_persona(self, persona_key: str) -> Optional[Dict[str, Any]]:
+        """Return the cached persona for a key, or None on a miss."""
+        resp = (
+            self.supabase.table("personas")
+            .select("*")
+            .eq("persona_key", persona_key)
+            .limit(1)
+            .execute()
+        )
+        if resp.data:
+            return self._persona_response(resp.data[0])
+        return None
+
+    def create_persona(
+        self,
+        persona_key: str,
+        profile: Dict[str, Any],
+        items: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Render one model image for a fresh combination and cache it.
+
+        `items` is the outfit builder's slot->product dict. We render a single
+        generic (no-selfie) full-body model wearing the pieces, upload it to the
+        public personas bucket, upsert the row, and return the response shape.
+        Upsert (not insert) so concurrent cold-starts on the same key converge
+        instead of racing to a duplicate-key error.
+        """
+        items_list = self._persona_items(items)
+        slots = self._extract_slots(items_list)
+
+        generated = self._generate_images(
+            top_image=slots.get("top") or "",
+            bottom_image=slots.get("bottom") or "",
+            shoes_image=slots.get("shoes") or "",
+            profile=profile or {},
+            count=1,
+        )
+        image_bytes = generated[0]
+
+        image_path = f"{persona_key.replace('|', '_')}.png"
+        self._upload_to_storage(image_path, image_bytes, bucket=PERSONAS_BUCKET)
+        image_url = self._public_url(image_path, PERSONAS_BUCKET)
+
+        style = (profile.get("style") or "").strip().lower()
+        row = {
+            "persona_key": persona_key,
+            "gender": (profile.get("gender") or "").strip().lower() or None,
+            "style": style or None,
+            "occasion": (profile.get("occasion") or "").strip().lower() or None,
+            "setting": (profile.get("setting") or "").strip().lower() or None,
+            "title": _PERSONA_TITLES.get(style, "Your Style"),
+            "subtitle": None,
+            "image_path": image_path,
+            "image_url": image_url,
+            "items": items_list,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        self.supabase.table("personas").upsert(
+            row, on_conflict="persona_key"
+        ).execute()
+
+        return self._persona_response(row)
+
+    def _persona_items(self, items: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Flatten the builder's slot->product dict into the fit-item shape
+        (slot + imageUrl + display fields) used for rendering and shop-the-look."""
+        result: List[Dict[str, Any]] = []
+        for slot, product in (items or {}).items():
+            if not product:
+                continue
+            result.append(
+                {
+                    "id": str(product.get("product_id") or slot),
+                    "slot": "shoes" if slot == "footwear" else slot,
+                    "name": product.get("product_title") or "Item",
+                    "brand": product.get("product_brand") or "",
+                    "price": product.get("product_price_amount") or 0,
+                    "imageUrl": product.get("product_img_link"),
+                    "link": product.get("product_link"),
+                }
+            )
+        return result
+
+    def _persona_response(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "persona_key": row.get("persona_key"),
+            "title": row.get("title"),
+            "subtitle": row.get("subtitle"),
+            "image_url": row.get("image_url"),
+            "items": row.get("items") or [],
+        }
+
+    def _public_url(self, image_path: str, bucket: str) -> str:
+        return f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{image_path}"
 
     def list_fits(self, user_id: str) -> List[Dict[str, Any]]:
         fits_resp = (
@@ -410,10 +542,11 @@ class FitImageService:
                     return base64.b64decode(inline["data"])
         return None
 
-    def _upload_to_storage(self, image_path: str, image_bytes: bytes) -> None:
-        upload_url = (
-            f"{SUPABASE_URL}/storage/v1/object/{FIT_IMAGES_BUCKET}/{image_path}"
-        )
+    def _upload_to_storage(
+        self, image_path: str, image_bytes: bytes, bucket: Optional[str] = None
+    ) -> None:
+        bucket = bucket or FIT_IMAGES_BUCKET
+        upload_url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{image_path}"
         headers = {
             "Authorization": f"Bearer {SUPABASE_KEY}",
             "apikey": SUPABASE_KEY,

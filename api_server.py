@@ -600,6 +600,69 @@ def build_outfit_from_quiz():
         return build_outfit()
 
 
+@app.route("/persona/resolve", methods=["POST"])
+def resolve_persona():
+    """Get-or-create a shared style persona image for the post-quiz reveal.
+
+    Keyed on a coarse combination (gender|style|occasion|setting) so images are
+    reused across users: cache hits return instantly, misses build an outfit +
+    render one full-body model image, then cache it. No auth required — this
+    runs during onboarding before the user has an account.
+
+    Expected payload: the quiz answers ({gender, occasion, weather, setting,
+    goals, style, budget}). Response:
+    {
+      "success": true,
+      "cached": true|false,
+      "persona_key": "masculine|classic|work|city",
+      "title": "The Classic",
+      "subtitle": null,
+      "image_url": "https://.../storage/v1/object/public/personas/....png",
+      "items": [{ id, slot, name, price, imageUrl, link }, ...]
+    }
+    """
+    data = request.get_json()
+    if not data:
+        logger.warning("/persona/resolve missing JSON payload")
+        return jsonify({"success": False, "error": "No JSON payload provided"}), 400
+
+    valid, error = validate_quiz_answers(data)
+    if not valid:
+        logger.warning("/persona/resolve validation failed: %s", error)
+        return jsonify({"success": False, "error": error}), 400
+
+    service = get_fit_image_service()
+    key = service.persona_key(data)
+
+    # Fast path: cache hit — no outfit build, no Gemini call.
+    try:
+        cached = service.get_persona(key)
+    except Exception as e:
+        logger.exception("Persona lookup failed key=%s error=%s", key, e)
+        cached = None
+
+    if cached:
+        logger.info("/persona/resolve HIT key=%s", key)
+        return jsonify({"success": True, "cached": True, **cached})
+
+    logger.info("/persona/resolve MISS key=%s — building + rendering", key)
+    try:
+        builder = get_outfit_builder()
+        outfit = builder.build_from_quiz(data)
+        items = outfit.get("items", {}) or {}
+        if not any(v is not None for v in items.values()):
+            return (
+                jsonify({"success": False, "error": "Could not build an outfit"}),
+                502,
+            )
+        persona = service.create_persona(key, data, items)
+        logger.info("/persona/resolve CREATED key=%s", key)
+        return jsonify({"success": True, "cached": False, **persona})
+    except Exception as e:
+        logger.exception("Persona create failed key=%s error=%s", key, e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/fits", methods=["POST"])
 def save_fit():
     """

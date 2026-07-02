@@ -76,3 +76,43 @@ def test_list_fits_skips_failed_signed_urls(monkeypatch):
 
     assert len(fits) == 1
     assert fits[0]["image_urls"] == ["https://signed.example/user_1/fit_1/1.png"]
+
+
+def test_persona_key_normalizes_and_orders():
+    key = FitImageService.persona_key(
+        {"gender": " Masculine ", "style": "Classic", "occasion": "WORK", "setting": "City"}
+    )
+    assert key == "masculine|classic|work|city"
+
+
+def test_persona_key_fills_missing_axes_with_any():
+    # Missing / empty axes must not shift positions — order is always
+    # gender|style|occasion|setting so the key matches the iOS client.
+    key = FitImageService.persona_key({"gender": "feminine", "occasion": "date"})
+    assert key == "feminine|any|date|any"
+
+
+def test_persona_items_flattens_and_drops_empty_slots():
+    service = FitImageService.__new__(FitImageService)
+    items = {
+        "top": {
+            "product_id": 42,
+            "product_title": "Linen Shirt",
+            "product_price_amount": 80,
+            "product_img_link": "https://img/top.jpg",
+            "product_link": "https://shop/top",
+        },
+        "bottom": None,  # unfilled slot — should be skipped
+        "footwear": {
+            "product_id": "shoe-1",
+            "product_title": "Loafers",
+            "product_img_link": "https://img/shoe.jpg",
+        },
+    }
+    result = service._persona_items(items)
+
+    assert [i["slot"] for i in result] == ["top", "shoes"]  # footwear -> shoes
+    assert result[0]["id"] == "42"
+    assert result[0]["imageUrl"] == "https://img/top.jpg"
+    assert result[0]["brand"] == ""
+    assert result[1]["price"] == 0
