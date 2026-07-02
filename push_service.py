@@ -217,20 +217,36 @@ _push_lock = threading.Lock()
 
 
 def _load_private_key() -> str:
+    import glob
     import os
 
+    # 1. Inline contents (APNS_KEY_P8), if provided.
     inline = os.getenv("APNS_KEY_P8")
     if inline:
         return inline
 
+    # 2. Explicit path (APNS_KEY_PATH), if provided.
     path = os.getenv("APNS_KEY_PATH")
+
+    # 3. Auto-discover the Render Secret File: a single .p8 under /etc/secrets.
+    #    Lets the mounted key "just work" with no env var to point at it.
+    if not path:
+        matches = sorted(glob.glob("/etc/secrets/*.p8"))
+        if len(matches) == 1:
+            path = matches[0]
+        elif len(matches) > 1:
+            raise RuntimeError(
+                "Multiple .p8 files in /etc/secrets; set APNS_KEY_PATH to pick "
+                f"one: {matches}"
+            )
+
     if path:
         with open(path, "r") as fh:
             return fh.read()
 
     raise RuntimeError(
-        "APNs key not configured: set APNS_KEY_PATH (e.g. a Render Secret File "
-        "at /etc/secrets/apns.p8) or APNS_KEY_P8 (inline .p8 contents)."
+        "APNs key not configured: add the .p8 as a Render Secret File (mounts "
+        "at /etc/secrets/), or set APNS_KEY_PATH / APNS_KEY_P8."
     )
 
 
