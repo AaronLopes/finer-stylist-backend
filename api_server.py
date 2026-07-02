@@ -27,6 +27,7 @@ Environment Variables Required:
 
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -41,6 +42,7 @@ from chat_service import get_chat_composer, get_chat_resolver
 from fit_image_service import FitImageService
 from outfit_builder import OutfitBuilder, create_outfit_builder
 from product_search_service import ProductSearchService
+from push_service import get_push_service
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -78,6 +80,24 @@ def get_product_search_service() -> ProductSearchService:
     if _product_search_service is None:
         _product_search_service = ProductSearchService()
     return _product_search_service
+
+
+_supabase_client = None
+
+
+def get_supabase_client():
+    """Process-wide service-role Supabase client (RLS-bypassing). Used by the
+    device-token registry and broadcast endpoints."""
+    global _supabase_client
+    if _supabase_client is None:
+        from supabase import create_client
+
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_KEY")
+        if not url or not key:
+            raise RuntimeError("SUPABASE_URL and SUPABASE_KEY are required.")
+        _supabase_client = create_client(url, key)
+    return _supabase_client
 
 
 def _short_user_id(user_id: Optional[str]) -> str:
@@ -1196,6 +1216,168 @@ def build_outfit_today():
         list(items_dict.keys()),
     )
     return jsonify(response_payload)
+
+
+# =============================================================================
+# PUSH NOTIFICATIONS
+# =============================================================================
+
+
+@app.route("/devices/register", methods=["POST"])
+def register_device():
+    """
+    Register (upsert) an APNs device token so it can receive pushes.
+
+    Called by the iOS app after the user grants notification permission and on
+    subsequent launches (tokens can rotate). user_id is optional — guest
+    devices still receive broadcasts.
+
+    Expected payload:
+    {
+      "device_token": "hex-encoded APNs token",   # required
+      "user_id": "uuid",                           # optional (null for guests)
+      "environment": "production" | "sandbox",     # optional, default production
+      "app_version": "1.2.0",                      # optional
+      "platform": "ios"                            # optional, default ios
+    }
+    """
+    data = request.get_json() or {}
+
+    token = (data.get("device_token") or "").strip()
+    if not token:
+        return (
+            jsonify({"success": False, "error": "Missing required field: device_token"}),
+            400,
+        )
+
+    environment = data.get("environment") or "production"
+    if environment not in ("production", "sandbox"):
+        environment = "production"
+
+    now = datetime.now(timezone.utc).isoformat()
+    row = {
+        "device_token": token,
+        "user_id": data.get("user_id"),
+        "platform": data.get("platform") or "ios",
+        "environment": environment,
+        "app_version": data.get("app_version"),
+        "is_active": True,
+        "updated_at": now,
+        "last_registered_at": now,
+    }
+
+    try:
+        get_supabase_client().table("device_tokens").upsert(
+            row, on_conflict="device_token"
+        ).execute()
+    except Exception as exc:
+        logger.exception("Device register failed token=%s err=%s", token[:8], exc)
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+    logger.info(
+        "/devices/register token=%s user=%s env=%s",
+        token[:8],
+        _short_user_id(data.get("user_id")),
+        environment,
+    )
+    return jsonify({"success": True})
+
+
+def _require_admin() -> bool:
+    """Fail-closed admin gate for broadcast. Returns True if authorized."""
+    expected = os.getenv("ADMIN_PUSH_TOKEN")
+    if not expected:
+        return False
+    return request.headers.get("X-Admin-Token") == expected
+
+
+@app.route("/admin/push/broadcast", methods=["POST"])
+def push_broadcast():
+    """
+    Send an announcement push to registered devices. Admin-only.
+
+    Auth: header `X-Admin-Token: <ADMIN_PUSH_TOKEN>`.
+
+    Expected payload:
+    {
+      "title": "The new update is here",       # required
+      "body": "We refreshed the catalog ✨",    # required
+      "subtitle": "optional",
+      "user_ids": ["uuid", ...],   # optional: target these users' devices only
+      "device_tokens": ["...."],   # optional: target these exact tokens only
+      "data": { "route": "discover" }  # optional custom payload keys
+    }
+
+    With neither user_ids nor device_tokens, sends to ALL active devices.
+    """
+    if not _require_admin():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+
+    data = request.get_json() or {}
+    title = (data.get("title") or "").strip()
+    body = (data.get("body") or "").strip()
+    if not title or not body:
+        return (
+            jsonify({"success": False, "error": "Missing required field: title/body"}),
+            400,
+        )
+
+    supabase = get_supabase_client()
+    try:
+        query = (
+            supabase.table("device_tokens")
+            .select("device_token,environment")
+            .eq("is_active", True)
+        )
+        if data.get("device_tokens"):
+            query = query.in_("device_token", data["device_tokens"])
+        elif data.get("user_ids"):
+            query = query.in_("user_id", data["user_ids"])
+        rows = query.execute().data or []
+    except Exception as exc:
+        logger.exception("Broadcast token fetch failed: %s", exc)
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+    if not rows:
+        return jsonify({"success": True, "sent": 0, "failed": 0, "deactivated": 0})
+
+    results = get_push_service().send_many(
+        rows,
+        title=title,
+        body=body,
+        subtitle=data.get("subtitle"),
+        data=data.get("data"),
+    )
+
+    sent = sum(1 for r in results if r.ok)
+    dead = [r.device_token for r in results if r.should_deactivate]
+
+    # Prune tokens APNs told us are permanently invalid.
+    if dead:
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            supabase.table("device_tokens").update(
+                {"is_active": False, "updated_at": now}
+            ).in_("device_token", dead).execute()
+        except Exception as exc:
+            logger.warning("Failed to deactivate dead tokens: %s", exc)
+
+    logger.info(
+        "/admin/push/broadcast targeted=%s sent=%s failed=%s deactivated=%s",
+        len(rows),
+        sent,
+        len(results) - sent,
+        len(dead),
+    )
+    return jsonify(
+        {
+            "success": True,
+            "targeted": len(rows),
+            "sent": sent,
+            "failed": len(results) - sent,
+            "deactivated": len(dead),
+        }
+    )
 
 
 # =============================================================================

@@ -11,5 +11,19 @@ services:
         sync: false
       - key: OPENAI_API_KEY
         sync: false
+      # --- APNs push notifications (push_service.py) ---
+      # APNS_KEY_PATH points at the Render Secret File holding the .p8 AuthKey,
+      # uploaded under Dashboard → Environment → Secret Files as
+      # AuthKey_W65ND4W7CX.p8 (mounts at /etc/secrets/<filename>).
+      - key: APNS_KEY_ID
+        value: W65ND4W7CX
+      - key: APNS_TEAM_ID
+        sync: false
+      - key: APNS_BUNDLE_ID
+        value: app.finer.fit
+      - key: APNS_KEY_PATH
+        value: /etc/secrets/AuthKey_W65ND4W7CX.p8
+      - key: ADMIN_PUSH_TOKEN
+        sync: false
       - key: PYTHON_VERSION
         value: 3.11.0
