@@ -12,6 +12,7 @@ Endpoints:
     POST /api/outfit/swap      - Swap single item in outfit
     POST /api/chat/parse       - Parse chat query (preview what we understood)
     GET  /products/search      - Semantic product search (iOS Search tab)
+    GET  /products/<id>        - Single product detail + sustainability score
     GET  /api/health           - Health check
 
 Usage:
@@ -950,6 +951,80 @@ def search_products():
     except Exception as e:
         logger.exception("/products/search failed q_len=%s error=%s", len(query), e)
         return jsonify({"success": False, "results": [], "error": str(e)}), 500
+
+
+@app.route("/products/<product_id>", methods=["GET"])
+def get_product_detail(product_id: str):
+    """
+    Single-product detail lookup, including the sustainability scoring
+    columns (s-mvp-v2). Backs the iOS ProductDetailView sheet — scores only
+    render there, so the client fetches this lazily per product instead of
+    the outfit/search payloads carrying score data.
+
+    Response `product` matches the outfit item serialization, plus:
+      - material: raw product_material text (nullable)
+      - sustainability:
+          score              0-100 float, null when withheld
+          grade              A-E letter, null when withheld
+          data_completeness  0-1 confidence in the inputs
+          score_version      e.g. "s-mvp-v2"
+          breakdown          full score_breakdown jsonb — the substantiation
+                             the UI must surface next to any score (fibers,
+                             certs, transport, sources). For withheld scores
+                             it carries only {reason, fiber_source,
+                             score_version}.
+    """
+    pid = (product_id or "").strip()
+    if not pid:
+        return jsonify({"success": False, "product": None, "error": "Missing product id"}), 400
+
+    try:
+        client = get_supabase_client()
+        result = (
+            client.table("finer_products_omega")
+            .select(
+                "product_id,product_title,product_img_link,product_link,"
+                "product_price_amount,product_slot,product_description,"
+                "product_material,product_s_score,s_score_grade,"
+                "score_data_completeness,score_version,score_breakdown"
+            )
+            .eq("product_id", pid)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            return jsonify({"success": False, "product": None, "error": "Product not found"}), 404
+
+        row = rows[0]
+        price = row.get("product_price_amount")
+        s_score = row.get("product_s_score")
+        product = {
+            "product_id": row.get("product_id"),
+            "product_title": row.get("product_title"),
+            "product_price_amount": float(price) if price is not None else None,
+            "product_img_link": row.get("product_img_link"),
+            "product_link": row.get("product_link"),
+            "slot": row.get("product_slot"),
+            "description": row.get("product_description"),
+            "material": row.get("product_material"),
+            "sustainability": {
+                "score": float(s_score) if s_score is not None else None,
+                "grade": row.get("s_score_grade"),
+                "data_completeness": row.get("score_data_completeness"),
+                "score_version": row.get("score_version"),
+                "breakdown": row.get("score_breakdown"),
+            },
+        }
+        logger.info(
+            "/products/<id> success product_id=%s scored=%s",
+            pid,
+            s_score is not None,
+        )
+        return jsonify({"success": True, "product": product, "error": None})
+    except Exception as e:
+        logger.exception("/products/<id> failed product_id=%s error=%s", pid, e)
+        return jsonify({"success": False, "product": None, "error": str(e)}), 500
 
 
 @app.route("/chat/resolve-intent", methods=["POST"])
