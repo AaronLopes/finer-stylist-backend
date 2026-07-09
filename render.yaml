@@ -3,7 +3,11 @@ services:
     name: finer-stylist-backend
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn api_server:app --bind 0.0.0.0:$PORT --timeout 300
+    # gthread with threads: the workload is I/O-bound (Supabase/OpenAI/Gemini
+    # round-trips). The previous single sync worker serialized ALL requests —
+    # one slow /fits stalled every other call (iOS Today card timed out
+    # waiting behind it, 2026-07-09).
+    startCommand: gunicorn api_server:app --bind 0.0.0.0:$PORT --timeout 300 --workers 2 --threads 4 --worker-class gthread
     envVars:
       - key: SUPABASE_URL
         sync: false

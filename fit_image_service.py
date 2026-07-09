@@ -372,12 +372,23 @@ class FitImageService:
             fit_id = row["fit_id"]
             images_by_fit.setdefault(fit_id, []).append(row)
 
+        # One batch sign call for every image across every fit — signing
+        # per-image serially (one storage round-trip each) made /fits take
+        # 10-15s at ~40 fits, which stalled the single-worker queue and
+        # timed out the iOS Today request behind it.
+        all_paths = [
+            img["image_path"]
+            for fit_images in images_by_fit.values()
+            for img in fit_images
+        ]
+        signed_by_path = self._create_signed_urls_batch(all_paths)
+
         normalized: List[Dict[str, Any]] = []
         for fit in fits:
             fit_images = images_by_fit.get(fit["id"], [])
             image_urls: List[str] = []
             for img in fit_images:
-                signed_url = self._create_signed_url_for_listing(img["image_path"])
+                signed_url = signed_by_path.get(img["image_path"])
                 if signed_url:
                     image_urls.append(signed_url)
             normalized.append(
@@ -394,6 +405,54 @@ class FitImageService:
             )
 
         return normalized
+
+    def _create_signed_urls_batch(self, image_paths: List[str]) -> Dict[str, str]:
+        """Sign many storage paths in one request.
+
+        Uses the bulk variant of the storage sign endpoint (same route as
+        `_create_signed_url`, but with a `paths` array). Returns
+        {path: full_signed_url}; paths that fail to sign are omitted.
+        """
+        if not image_paths:
+            return {}
+
+        sign_url = f"{SUPABASE_URL}/storage/v1/object/sign/{FIT_IMAGES_BUCKET}"
+        headers = {
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "apikey": SUPABASE_KEY,
+            "Content-Type": "application/json",
+        }
+        try:
+            response = requests.post(
+                sign_url,
+                headers=headers,
+                json={"expiresIn": SIGNED_URL_TTL_SECONDS, "paths": image_paths},
+                timeout=15,
+            )
+            if not response.ok:
+                raise RuntimeError(
+                    f"Could not batch-create signed URLs ({response.status_code}): {response.text[:250]}"
+                )
+            rows = response.json()
+        except Exception as exc:
+            logger.warning(
+                "Batch signed URL request failed (%s paths) error=%s",
+                len(image_paths),
+                exc,
+            )
+            return {}
+
+        signed_by_path: Dict[str, str] = {}
+        for row in rows or []:
+            path = row.get("path")
+            signed_path = row.get("signedURL") or ""
+            if not path or not signed_path:
+                continue
+            if signed_path.startswith(("http://", "https://")):
+                signed_by_path[path] = signed_path
+            else:
+                signed_by_path[path] = f"{SUPABASE_URL}/storage/v1{signed_path}"
+        return signed_by_path
 
     def _create_signed_url_for_listing(self, image_path: str) -> Optional[str]:
         try:
