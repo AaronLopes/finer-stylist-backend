@@ -19,11 +19,14 @@ Usage:
     outfit = builder.build_from_chat(query, user_profile)
 """
 
+import hashlib
 import json
 import logging
 import os
+import random
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from enum import Enum
 from typing import Dict, List, Optional, Any, Set
 
@@ -306,6 +309,14 @@ CHAT_CATEGORY_ALIASES: Dict[str, Dict[str, List[str]]] = {
 
 SLOT_CANDIDATE_POOL_SIZE = 8
 
+# Today builds pick from the top-N candidates per slot with a per-(user, day)
+# seeded RNG so outfits vary across days and users. Note the slot RPCs are
+# themselves non-deterministic (randomized ordering in the DB function), so
+# the seed makes the pick reproducible only for a given candidate pool —
+# same-day stability for signed-in users comes from the finer_daily_fits
+# cache, not from rebuild determinism. Other paths keep top-1 selection.
+TODAY_VARIANCE_POOL_SIZE = 5
+
 UNDERWEAR_RE = re.compile(
     r"\b(underwear|boxer\s*briefs?|boxers?|briefs?|panties|bras?|bralettes?|"
     r"lingerie|thongs?|knickers?)\b",
@@ -522,6 +533,54 @@ def _event_to_occasion(event: Optional[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+# Day-aware fallback pools for Today builds with no calendar event.
+# The stored quiz occasion joins the pool as an influence (see
+# _rotating_fallback_occasion) rather than being used literally every day.
+WEEKDAY_OCCASION_POOL: List[str] = ["work", "casual"]
+WEEKEND_OCCASION_POOL: List[str] = ["casual", "going-out"]
+
+
+def _stable_hash(text: str) -> int:
+    """
+    Deterministic string hash. Never use builtin hash() here — it is salted
+    per process, which would break cache-key determinism across workers.
+    """
+    return int(hashlib.sha256(text.encode()).hexdigest()[:12], 16)
+
+
+def _rotating_fallback_occasion(
+    profile_occasion: Optional[str],
+    gender: str,
+    local_date_str: Optional[str],
+    user_id: Optional[str],
+) -> str:
+    """
+    Pick today's occasion when no calendar event resolves one.
+
+    Deterministic per (user, date) so the Today cache key stays stable all
+    day, and rotates with date.toordinal() so consecutive same-pool days
+    always differ. The user's quiz occasion joins the pool when it fits the
+    day type instead of dictating every day's occasion.
+    """
+    try:
+        local_date = date.fromisoformat(local_date_str or "")
+    except ValueError:
+        local_date = date.today()
+
+    is_weekend = local_date.weekday() >= 5
+    pool = list(WEEKEND_OCCASION_POOL if is_weekend else WEEKDAY_OCCASION_POOL)
+
+    if profile_occasion == "gym" and gender != "masculine":
+        # Masculine gym inventory is thin (see build_for_today remap);
+        # keep rotation from steering masculine users into gym fits.
+        pool.append("gym")
+    elif profile_occasion == "date" and is_weekend:
+        pool.append("date")
+
+    offset = _stable_hash(user_id or "anon") % len(pool)
+    return pool[(local_date.toordinal() + offset) % len(pool)]
+
+
 class OutfitBuilder:
     """
     Main outfit building service.
@@ -706,11 +765,15 @@ class OutfitBuilder:
         rpc_params: Dict[str, Any],
         slot_name: str,
         slot_config: Optional[SlotConfig] = None,
+        rng: Optional[random.Random] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Try the primary product table first. If it returns empty, fall back
         to the secondary. Order controlled by PRIMARY_RPC env var.
-        Returns the best item dict with a _source annotation, or None.
+        Returns an item dict with a _source annotation, or None. With rng,
+        picks among the winning table's allowed candidates instead of top-1;
+        rng is consumed at most once per call so selection stays deterministic
+        for a given seed.
         """
         slot_config = slot_config or SlotConfig(slot_name, formality=3)
         category_filters = self._category_filters(slot_config)
@@ -724,16 +787,25 @@ class OutfitBuilder:
                 result = self.supabase.rpc(
                     rpc_name, self._rpc_params_for_name(rpc_name, query_params)
                 ).execute()
-                if result.data and len(result.data) > 0:
-                    for item in result.data:
-                        if not self._candidate_allowed_for_slot(item, slot_config):
-                            continue
-                        item["_source"] = label
-                        logger.info(
-                            "  ✓ [%s] slot=%s found %d candidates",
-                            label, slot_name, len(result.data),
-                        )
-                        return item
+                allowed = [
+                    item
+                    for item in (result.data or [])
+                    if self._candidate_allowed_for_slot(item, slot_config)
+                ]
+                if allowed:
+                    if rng:
+                        # RPC ordering is unstable on score ties — sort the
+                        # pool canonically so the seeded pick is reproducible.
+                        allowed.sort(key=lambda c: str(c.get("product_id") or ""))
+                        item = rng.choice(allowed)
+                    else:
+                        item = allowed[0]
+                    item["_source"] = label
+                    logger.info(
+                        "  ✓ [%s] slot=%s found %d candidates (%d allowed)",
+                        label, slot_name, len(result.data or []), len(allowed),
+                    )
+                    return item
                 logger.info("  ↓ [%s] slot=%s empty, trying next", label, slot_name)
             except Exception as e:
                 logger.warning(
@@ -827,6 +899,7 @@ class OutfitBuilder:
         profile: Optional[Dict[str, Any]] = None,
         chat_extract: Optional[Dict[str, Any]] = None,
         today_context: Optional[Dict[str, Any]] = None,
+        user_id: Optional[str] = None,
     ) -> OutfitParams:
         """
         Single canonical translator from any input shape to OutfitParams.
@@ -837,6 +910,8 @@ class OutfitBuilder:
             3. today_context    — live weather + calendar from device
 
         Live signals (Today) win over chat hints, which win over stored profile.
+        user_id is only used by the today overlay to stagger the no-event
+        occasion rotation per user.
         """
 
         # Defaults
@@ -965,14 +1040,26 @@ class OutfitBuilder:
             season_tags = list(cfg.get("season_tags", []))
             avoid_tags = list(cfg.get("avoid_tags", []))
 
-            # Occasion: calendar event wins, fallback to "casual"
-            inferred_event_occasion = _event_to_occasion(
-                today_context.get("primary_event")
-            )
+            # Occasion: calendar event wins, otherwise a day-aware rotation
+            # so the stored quiz occasion doesn't dictate every quiet day.
+            sources = today_context.get("sources") or {}
+            primary_event = today_context.get("primary_event")
+            if sources.get("event") == "profile_fallback":
+                # Legacy iOS builds synthesized a fake event from the quiz
+                # occasion when the calendar was empty — ignore it.
+                primary_event = None
+            inferred_event_occasion = _event_to_occasion(primary_event)
             if inferred_event_occasion:
                 occasion = inferred_event_occasion
-                if occasion in OCCASION_STYLE_OVERRIDE:
-                    style_tags = OCCASION_STYLE_OVERRIDE[occasion].copy()
+            else:
+                occasion = _rotating_fallback_occasion(
+                    (profile or {}).get("occasion"),
+                    gender,
+                    today_context.get("local_date"),
+                    user_id,
+                )
+            if occasion in OCCASION_STYLE_OVERRIDE:
+                style_tags = OCCASION_STYLE_OVERRIDE[occasion].copy()
 
             # Location: LLM classification wins, fallback to "city"
             city_label = today_context.get("city_label")
@@ -1233,6 +1320,8 @@ Only include fields you can confidently extract. Be concise."""
         self,
         profile: Optional[Dict[str, Any]] = None,
         today_context: Optional[Dict[str, Any]] = None,
+        user_id: Optional[str] = None,
+        variance_seed: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Build an outfit for the Today tab using live weather + calendar context
@@ -1247,12 +1336,15 @@ Only include fields you can confidently extract. Be concise."""
                 "condition": str | None,
                 "daypart": str | None,
                 "city_label": str | None,          # e.g. "Brooklyn, NY" → setting inference
-                "primary_event": {                 # fallback: casual occasion
+                "local_date": str | None,          # "YYYY-MM-DD" — rotation + cache key
+                "primary_event": {                 # fallback: day-aware occasion rotation
                     "title": str,
                     "category": str | None,
                     "all_day": bool | None,
                 } | None,
             }
+            user_id: staggers the no-event occasion rotation per user
+            variance_seed: per-(user, day) seed for top-N item selection
 
         Returns:
             Complete outfit dict (same shape as build_from_quiz / build_from_chat).
@@ -1262,7 +1354,9 @@ Only include fields you can confidently extract. Be concise."""
             list((profile or {}).keys()),
             list((today_context or {}).keys()),
         )
-        params = self.build_params(profile=profile, today_context=today_context)
+        params = self.build_params(
+            profile=profile, today_context=today_context, user_id=user_id
+        )
 
         # Masculine gym remap: neither chi nor omega has meaningful masculine
         # gym inventory. Remap to casual with athletic-casual style tags.
@@ -1286,7 +1380,7 @@ Only include fields you can confidently extract. Be concise."""
             )
 
         formula = OCCASION_FORMULAS.get(params.occasion, OCCASION_FORMULAS["casual"])
-        return self._build_outfit(params, formula)
+        return self._build_outfit(params, formula, variance_seed=variance_seed)
 
     # =========================================================================
     # CHAT HELPERS
@@ -1350,7 +1444,10 @@ Only include fields you can confidently extract. Be concise."""
     # =========================================================================
 
     def _build_outfit(
-        self, params: OutfitParams, formula: OutfitFormula
+        self,
+        params: OutfitParams,
+        formula: OutfitFormula,
+        variance_seed: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Build a complete outfit by querying each slot with context.
@@ -1358,7 +1455,12 @@ Only include fields you can confidently extract. Be concise."""
         Maintains outfit cohesion by passing:
         - Already selected colors (avoid exact repeats)
         - Already selected textures (encourage diversity)
+
+        With variance_seed, each slot picks from the top candidates with a
+        seeded RNG (slots are visited in fixed formula order, so the pick is
+        reproducible for a given set of RPC results).
         """
+        rng = random.Random(variance_seed) if variance_seed is not None else None
         outfit = {
             "items": {},
             "params_used": {
@@ -1413,11 +1515,11 @@ Only include fields you can confidently extract. Be concise."""
                     "p_affiliate_boost_weight": params.affiliate_boost_weight,
                     "p_include_categories": category_filters["include"],
                     "p_exclude_categories": category_filters["exclude"],
-                    "p_n": 1,
+                    "p_n": TODAY_VARIANCE_POOL_SIZE if rng else 1,
                 }
 
                 item = self._query_slot_with_fallback(
-                    rpc_params, slot_config.slot, slot_config=attempt_config
+                    rpc_params, slot_config.slot, slot_config=attempt_config, rng=rng
                 )
                 if item:
                     break

@@ -49,12 +49,15 @@ class FitImageService:
         profile: Optional[Dict[str, Any]] = None,
         count: int = 3,
         selfie_url: Optional[str] = None,
+        occasion: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Generate Gemini images for an EXISTING fit row and attach them.
 
         Used so a Today fit (already persisted via save_fit when /outfit/build/today
         ran) gets its outfit pictures appended to the same row instead of
         spawning a duplicate. The fit_id must already exist in user_fits.
+        occasion overrides the profile occasion in the prompt — Today fits'
+        resolved occasion (calendar/rotation) can differ from the stored one.
         """
         slots = self._extract_slots(items)
         generated_images = self._generate_images(
@@ -64,6 +67,7 @@ class FitImageService:
             profile=profile or {},
             count=count,
             selfie_url=selfie_url,
+            occasion=occasion,
         )
 
         # Touch the fit's updated_at so the Fits list re-orders correctly.
@@ -164,6 +168,7 @@ class FitImageService:
         profile: Optional[Dict[str, Any]] = None,
         count: int = 3,
         selfie_url: Optional[str] = None,
+        occasion: Optional[str] = None,
     ) -> Dict[str, Any]:
         slots = self._extract_slots(items)
         generated_images = self._generate_images(
@@ -173,6 +178,7 @@ class FitImageService:
             profile=profile or {},
             count=count,
             selfie_url=selfie_url,
+            occasion=occasion,
         )
 
         fit_payload = {
@@ -485,6 +491,7 @@ class FitImageService:
         profile: Dict[str, Any],
         count: int,
         selfie_url: Optional[str] = None,
+        occasion: Optional[str] = None,
     ) -> List[bytes]:
         available = [url for url in [top_image, bottom_image, shoes_image] if url]
         if not available:
@@ -517,7 +524,7 @@ class FitImageService:
 
         gender = profile.get("gender") or ""
         style = profile.get("style") or ""
-        occasion = profile.get("occasion") or ""
+        occasion = occasion or profile.get("occasion") or ""
 
         def _call_gemini(variation: int) -> Optional[bytes]:
             prompt = self._build_prompt(gender, style, occasion, variation, has_face)

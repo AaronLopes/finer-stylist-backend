@@ -41,7 +41,7 @@ load_dotenv()
 
 from chat_service import get_chat_composer, get_chat_resolver
 from fit_image_service import FitImageService
-from outfit_builder import OutfitBuilder, create_outfit_builder
+from outfit_builder import OutfitBuilder, _stable_hash, create_outfit_builder
 from product_search_service import ProductSearchService
 from push_service import get_push_service
 
@@ -794,6 +794,12 @@ def generate_fit_images():
     # Optional Precision Fit likeness reference (Pro). When present, the model is
     # rendered with the user's own face instead of a generic model.
     selfie_url = data.get("selfie_url") or None
+    # Resolved occasion for the image prompt. Today fits pass this explicitly
+    # because their occasion (calendar/rotation) can differ from the stored
+    # profile occasion.
+    occasion = data.get("occasion") or (
+        profile.get("occasion") if isinstance(profile, dict) else None
+    )
 
     try:
         if existing_fit_id:
@@ -805,6 +811,7 @@ def generate_fit_images():
                 profile=profile,
                 count=int(data.get("count") or 3),
                 selfie_url=selfie_url,
+                occasion=occasion,
             )
         else:
             result = service.create_fit_with_images(
@@ -816,6 +823,7 @@ def generate_fit_images():
                 profile=profile,
                 count=int(data.get("count") or 3),
                 selfie_url=selfie_url,
+                occasion=occasion,
             )
 
         logger.info(
@@ -1185,14 +1193,21 @@ def build_outfit_today():
         "condition": "sunny" | "rainy" | ... | null,
         "daypart": "morning" | "afternoon" | "evening" | null,
         "city_label": str | null,           # e.g. "Brooklyn, NY" → setting inference; fallback: "city"
-        "primary_event": {                  # null → fallback: "casual" occasion
+        "primary_event": {                  # null → day-aware occasion rotation
           "title": str,
           "category": str | null,
           "all_day": bool | null
         } | null,
-        "local_date": "YYYY-MM-DD" | null   # iOS-supplied for cache key
+        "local_date": "YYYY-MM-DD" | null   # iOS-supplied for cache key + rotation
       }
     }
+
+    With no calendar event, the occasion is no longer the stored quiz answer:
+    it rotates per (user, day) between day-appropriate occasions (see
+    outfit_builder._rotating_fallback_occasion). Item selection on cache miss
+    picks from the top candidates per slot with a per-(user, day) seeded RNG;
+    same-day stability comes from the finer_daily_fits cache (the slot RPCs
+    are themselves randomized).
     """
     from datetime import date as _date
 
@@ -1208,9 +1223,12 @@ def build_outfit_today():
     builder = get_outfit_builder()
 
     # Resolve params first so we know the inferred occasion (cache key component)
-    params = builder.build_params(profile=profile, today_context=today_context)
+    params = builder.build_params(
+        profile=profile, today_context=today_context, user_id=user_id
+    )
     occasion = params.occasion
     cache_date = local_date_str or _date.today().isoformat()
+    variance_seed = _stable_hash(f"{user_id or 'anon'}:{cache_date}")
 
     logger.info(
         "/outfit/build/today user=%s date=%s occasion=%s context_keys=%s",
@@ -1271,7 +1289,12 @@ def build_outfit_today():
 
     # ----- Cache miss → generate -----
     try:
-        outfit = builder.build_for_today(profile=profile, today_context=today_context)
+        outfit = builder.build_for_today(
+            profile=profile,
+            today_context=today_context,
+            user_id=user_id,
+            variance_seed=variance_seed,
+        )
     except Exception as exc:
         logger.exception(
             "/outfit/build/today build failed user=%s error=%s",
