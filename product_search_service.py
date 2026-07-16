@@ -60,6 +60,7 @@ class ProductSearchService:
         item: Dict[str, Any] = {
             "product_id": row.get("product_id"),
             "product_title": row.get("product_title"),
+            "product_brand": row.get("product_brand"),
             "product_price_amount": float(price) if price is not None else None,
             "product_img_link": row.get("product_img_link"),
             "product_link": row.get("product_link"),

@@ -23,6 +23,7 @@ import api_server  # noqa: E402
 FAKE_RESULT = {
     "product_id": "awin_114434_1",
     "product_title": "Linen Shirt: White Tops - Size Medium",
+    "product_brand": "Haus",
     "product_price_amount": 24.99,
     "product_img_link": "https://img.example/1.jpg",
     "product_link": "https://shop.example/1",

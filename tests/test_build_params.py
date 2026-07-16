@@ -22,7 +22,10 @@ from outfit_builder import (  # noqa: E402
     ColorStrategy,
     OutfitBuilder,
     OutfitParams,
+    WEEKDAY_OCCASION_POOL,
+    WEEKEND_OCCASION_POOL,
     _event_to_occasion,
+    _rotating_fallback_occasion,
     _temp_to_weather_bucket,
 )
 
@@ -255,12 +258,14 @@ def test_today_overlay_event_overrides_profile_occasion(builder):
     assert "work" in params.occasion_tags
 
 
-def test_today_overlay_no_event_keeps_profile_occasion(builder):
+def test_today_overlay_no_event_rotates_occasion(builder):
+    # No calendar event → day-aware rotation, NOT the stored quiz occasion.
+    # 2026-07-15 is a Wednesday; "date" only joins the weekend pool.
     params = builder.build_params(
         profile={"occasion": "date"},
-        today_context={"temp_f": 70},  # no primary_event
+        today_context={"temp_f": 70, "local_date": "2026-07-15"},
     )
-    assert params.occasion == "date"
+    assert params.occasion in WEEKDAY_OCCASION_POOL
 
 
 def test_today_overlay_gym_event_applies_override_tags(builder):
@@ -282,7 +287,10 @@ def test_today_overlay_empty_context_applies_fallback_defaults(builder):
         profile={"occasion": "date", "style": "classic"},
         today_context={},
     )
-    assert params.occasion == "date"
+    # No local_date → rotation uses server date; just assert it's a valid pool member
+    assert params.occasion in set(
+        WEEKDAY_OCCASION_POOL + WEEKEND_OCCASION_POOL + ["date"]
+    )
     # Moderate weather fallback
     assert any(t in params.season_tags for t in ("spring", "fall", "all_season"))
     # City setting fallback (urban, polished, etc.)
@@ -404,10 +412,76 @@ def test_today_no_temp_defaults_to_moderate(builder):
     assert params.avoid_tags == []  # moderate has no avoid tags
 
 
-def test_today_no_event_keeps_occasion(builder):
+# -----------------------------------------------------------------------------
+# No-event occasion rotation
+# -----------------------------------------------------------------------------
+
+
+def test_rotation_is_deterministic():
+    a = _rotating_fallback_occasion("date", "feminine", "2026-07-15", "user-1")
+    b = _rotating_fallback_occasion("date", "feminine", "2026-07-15", "user-1")
+    assert a == b
+
+
+def test_rotation_consecutive_days_differ():
+    # 2026-07-13/14 are Mon/Tue — same weekday pool, so rotation must alternate.
+    mon = _rotating_fallback_occasion("work", "feminine", "2026-07-13", "user-1")
+    tue = _rotating_fallback_occasion("work", "feminine", "2026-07-14", "user-1")
+    assert mon != tue
+    assert {mon, tue} <= set(WEEKDAY_OCCASION_POOL)
+
+
+def test_rotation_weekend_uses_weekend_pool():
+    # 2026-07-18/19 are Sat/Sun; profile "date" joins the weekend pool.
+    for d in ("2026-07-18", "2026-07-19"):
+        occ = _rotating_fallback_occasion("date", "feminine", d, "user-1")
+        assert occ in set(WEEKEND_OCCASION_POOL + ["date"])
+
+
+def test_rotation_gym_profile_joins_pool_except_masculine():
+    dates = [f"2026-07-{day:02d}" for day in range(13, 27)]  # two full weeks
+    feminine = {
+        _rotating_fallback_occasion("gym", "feminine", d, "user-1") for d in dates
+    }
+    masculine = {
+        _rotating_fallback_occasion("gym", "masculine", d, "user-1") for d in dates
+    }
+    assert "gym" in feminine  # gym cycles in for feminine users
+    assert "gym" not in masculine  # never steered into thin masculine gym inventory
+
+
+def test_rotation_bad_local_date_does_not_raise():
+    occ = _rotating_fallback_occasion("casual", "feminine", "not-a-date", "user-1")
+    assert occ in set(WEEKDAY_OCCASION_POOL + WEEKEND_OCCASION_POOL)
+    occ = _rotating_fallback_occasion(None, "genderless", None, None)
+    assert occ in set(WEEKDAY_OCCASION_POOL + WEEKEND_OCCASION_POOL)
+
+
+def test_today_profile_fallback_event_is_ignored(builder):
+    # Legacy iOS builds synthesized a fake event from the quiz occasion —
+    # the backend must strip it and rotate instead. Weekday date, so a
+    # forced "date" occasion would be a bug.
     params = builder.build_params(
-        profile={"occasion": "work"},
-        today_context={"temp_f": 65},
+        profile={"occasion": "date"},
+        today_context={
+            "temp_f": 70,
+            "local_date": "2026-07-15",  # Wednesday
+            "primary_event": {"title": "Date Night", "category": "date"},
+            "sources": {"event": "profile_fallback"},
+        },
+    )
+    assert params.occasion in WEEKDAY_OCCASION_POOL
+
+
+def test_today_live_event_still_wins(builder):
+    params = builder.build_params(
+        profile={"occasion": "date"},
+        today_context={
+            "temp_f": 70,
+            "local_date": "2026-07-18",  # Saturday — rotation would avoid "work"
+            "primary_event": {"title": "Standup with team"},
+            "sources": {"event": "live"},
+        },
     )
     assert params.occasion == "work"
 
@@ -421,7 +495,7 @@ def test_build_for_today_masculine_gym_remaps_to_casual(builder, monkeypatch):
     monkeypatch.setattr(
         OutfitBuilder,
         "_build_outfit",
-        lambda self, params, formula: {
+        lambda self, params, formula, variance_seed=None: {
             "params": params,
             "formula": formula,
         },
@@ -441,7 +515,7 @@ def test_build_for_today_feminine_gym_not_remapped(builder, monkeypatch):
     monkeypatch.setattr(
         OutfitBuilder,
         "_build_outfit",
-        lambda self, params, formula: {
+        lambda self, params, formula, variance_seed=None: {
             "params": params,
             "formula": formula,
         },
