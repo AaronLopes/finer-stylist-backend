@@ -98,6 +98,7 @@ def test_persona_items_flattens_and_drops_empty_slots():
         "top": {
             "product_id": 42,
             "product_title": "Linen Shirt",
+            "product_brand": "Afends",
             "product_price_amount": 80,
             "product_img_link": "https://img/top.jpg",
             "product_link": "https://shop/top",
@@ -114,5 +115,6 @@ def test_persona_items_flattens_and_drops_empty_slots():
     assert [i["slot"] for i in result] == ["top", "shoes"]  # footwear -> shoes
     assert result[0]["id"] == "42"
     assert result[0]["imageUrl"] == "https://img/top.jpg"
-    assert result[0]["brand"] == ""
+    assert result[0]["brand"] == "Afends"
+    assert result[1]["brand"] == ""  # no product_brand -> empty fallback
     assert result[1]["price"] == 0

@@ -991,10 +991,11 @@ def get_product_detail(product_id: str):
         result = (
             client.table("finer_products_omega")
             .select(
-                "product_id,product_title,product_img_link,product_link,"
-                "product_price_amount,product_slot,product_description,"
-                "product_material,product_s_score,s_score_grade,"
-                "score_data_completeness,score_version,score_breakdown"
+                "product_id,product_title,product_brand,product_img_link,"
+                "product_link,product_price_amount,product_slot,"
+                "product_description,product_material,product_s_score,"
+                "s_score_grade,score_data_completeness,score_version,"
+                "score_breakdown"
             )
             .eq("product_id", pid)
             .limit(1)
@@ -1010,6 +1011,7 @@ def get_product_detail(product_id: str):
         product = {
             "product_id": row.get("product_id"),
             "product_title": row.get("product_title"),
+            "product_brand": row.get("product_brand"),
             "product_price_amount": float(price) if price is not None else None,
             "product_img_link": row.get("product_img_link"),
             "product_link": row.get("product_link"),
@@ -1165,6 +1167,7 @@ def _persisted_items_to_api_dict(persisted_items: Any) -> Dict[str, Dict[str, An
         result[api_slot] = {
             "product_id": item.get("id"),
             "product_title": item.get("name"),
+            "product_brand": item.get("brand"),
             "product_price_amount": item.get("price"),
             "product_img_link": item.get("imageUrl"),
             "product_link": item.get("link"),
@@ -1322,7 +1325,7 @@ def build_outfit_today():
                 "id": str(product.get("product_id") or ""),
                 "slot": "shoes" if slot == "footwear" else slot,
                 "name": product.get("product_title") or "Untitled",
-                "brand": "FinerFit",
+                "brand": product.get("product_brand") or "FinerFit",
                 "price": float(product.get("product_price_amount") or 0),
                 "imageUrl": product.get("product_img_link"),
                 "link": product.get("product_link"),
