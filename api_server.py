@@ -41,7 +41,7 @@ load_dotenv()
 
 from chat_service import get_chat_composer, get_chat_resolver
 from fit_image_service import FitImageService
-from outfit_builder import OutfitBuilder, _stable_hash, create_outfit_builder
+from outfit_builder import OutfitBuilder, _rpc_gender, _stable_hash, create_outfit_builder
 from product_search_service import ProductSearchService
 from push_service import get_push_service
 
@@ -918,6 +918,9 @@ def search_products():
     Query params:
       - q (required): natural-language search text
       - limit (optional, default 20, capped at 50)
+      - gender (optional): profile gender; masculine/feminine restrict
+        results to that label + genderless, anything else means no filter
+        (same rule as the outfit RPCs, migrations/009_gender_filtering.sql)
     """
     query = (request.args.get("q") or "").strip()
     if not query:
@@ -949,11 +952,15 @@ def search_products():
         )
     limit = max(1, min(limit, MAX_SEARCH_LIMIT))
 
-    logger.info("/products/search q_len=%s limit=%s", len(query), limit)
+    gender = _rpc_gender(request.args.get("gender"))
+
+    logger.info(
+        "/products/search q_len=%s limit=%s gender=%s", len(query), limit, gender
+    )
 
     try:
         service = get_product_search_service()
-        results = service.search(query, limit=limit)
+        results = service.search(query, limit=limit, gender=gender)
         logger.info("/products/search success result_count=%s", len(results))
         return jsonify({"success": True, "results": results, "error": None})
     except Exception as e:

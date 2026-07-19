@@ -39,8 +39,8 @@ class FakeSearchService:
         self.error = error
         self.calls = []
 
-    def search(self, query, limit=20):
-        self.calls.append((query, limit))
+    def search(self, query, limit=20, gender=None):
+        self.calls.append((query, limit, gender))
         if self.error:
             raise self.error
         return self.results
@@ -92,19 +92,38 @@ def test_success_envelope(client, fake_service):
     assert body["success"] is True
     assert body["error"] is None
     assert body["results"] == [FAKE_RESULT]
-    assert fake_service.calls == [("linen shirt", 20)]
+    assert fake_service.calls == [("linen shirt", 20, None)]
 
 
 def test_limit_is_capped_at_50(client, fake_service):
     response = client.get("/products/search?q=dress&limit=500")
     assert response.status_code == 200
-    assert fake_service.calls == [("dress", 50)]
+    assert fake_service.calls == [("dress", 50, None)]
 
 
 def test_limit_floor_is_1(client, fake_service):
     response = client.get("/products/search?q=dress&limit=-3")
     assert response.status_code == 200
-    assert fake_service.calls == [("dress", 1)]
+    assert fake_service.calls == [("dress", 1, None)]
+
+
+def test_gender_masculine_passes_through(client, fake_service):
+    response = client.get("/products/search?q=dress&gender=masculine")
+    assert response.status_code == 200
+    assert fake_service.calls == [("dress", 20, "masculine")]
+
+
+def test_gender_feminine_passes_through(client, fake_service):
+    response = client.get("/products/search?q=dress&gender=Feminine")
+    assert response.status_code == 200
+    assert fake_service.calls == [("dress", 20, "feminine")]
+
+
+def test_gender_nonbinary_means_no_filter(client, fake_service):
+    for value in ("unisex", "non-binary", "genderless", "anything-else"):
+        response = client.get(f"/products/search?q=dress&gender={value}")
+        assert response.status_code == 200
+    assert fake_service.calls == [("dress", 20, None)] * 4
 
 
 def test_service_failure_returns_500_envelope(client):

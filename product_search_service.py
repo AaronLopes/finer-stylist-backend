@@ -9,7 +9,7 @@ cosine over finer_products_omega, migrations/004_product_semantic_search.sql).
 
 import logging
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import supabase
 from openai import OpenAI
@@ -40,13 +40,19 @@ class ProductSearchService:
         response = self.openai.embeddings.create(model=EMBED_MODEL, input=[query])
         return response.data[0].embedding
 
-    def search(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """Embed the query and rank products by cosine similarity in-database."""
+    def search(
+        self, query: str, limit: int = 20, gender: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Embed the query and rank products by cosine similarity in-database.
+
+        gender must already be RPC-normalized (outfit_builder._rpc_gender):
+        'masculine'/'feminine' filter to that label + genderless, None means
+        no filter."""
         embedding = self.embed_query(query)
-        result = self.supabase.rpc(
-            SEARCH_RPC,
-            {"query_embedding": embedding, "match_count": limit},
-        ).execute()
+        params: Dict[str, Any] = {"query_embedding": embedding, "match_count": limit}
+        if gender:
+            params["p_gender"] = gender
+        result = self.supabase.rpc(SEARCH_RPC, params).execute()
         return [self._serialize(row) for row in (result.data or [])]
 
     @staticmethod
