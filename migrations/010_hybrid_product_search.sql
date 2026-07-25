@@ -133,20 +133,7 @@ AS $$
       ) AS category_match,
       (
         cardinality(p.colors) > 0
-        AND (
-          lower(btrim(coalesce(f.product_color, ''), ' .')) = ANY(p.colors)
-          OR EXISTS (
-            SELECT 1
-            FROM unnest(p.colors) AS wanted_color
-            WHERE (' ' || words.title_words || ' ')
-              LIKE ('% ' || wanted_color || ' %')
-          )
-          OR EXISTS (
-            SELECT 1
-            FROM unnest(coalesce(f.product_tags, ARRAY[]::text[])) AS product_tag
-            WHERE lower(btrim(product_tag)) = ANY(p.colors)
-          )
-        )
+        AND lower(btrim(coalesce(f.product_color, ''), ' .')) = ANY(p.colors)
       ) AS color_match,
       (
         p.brand_query_compact <> ''
