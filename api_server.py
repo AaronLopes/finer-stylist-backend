@@ -12,7 +12,7 @@ Endpoints:
     POST /api/outfit/swap      - Swap single item in outfit
     POST /api/chat/parse       - Parse chat query (preview what we understood)
     POST /materials/scan       - Estimate a garment's basic material
-    GET  /products/search      - Semantic product search (iOS Search tab)
+    GET  /products/search      - Hybrid product search (iOS Search tab)
     GET  /products/<id>        - Single product detail + sustainability score
     GET  /api/health           - Health check
 
@@ -1053,12 +1053,12 @@ def list_user_fits():
 @app.route("/products/search", methods=["GET"])
 def search_products():
     """
-    Semantic product search over the catalog.
+    Hybrid semantic and structured product search over the catalog.
 
     Backs the iOS Search tab (ProductSearching protocol — see
-    finer-ios docs/backend-blanks.md). Embeds the query with fashionSigLIP
-    and ranks by pgvector cosine similarity via the match_products_semantic
-    RPC.
+    finer-ios docs/backend-blanks.md). Expands broad fashion categories,
+    embeds fuzzy concepts with OpenAI, and combines vector similarity with
+    exact category/color and lexical brand signals via match_products_hybrid.
 
     Query params:
       - q (required): natural-language search text

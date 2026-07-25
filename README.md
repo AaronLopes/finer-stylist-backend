@@ -19,7 +19,7 @@ Flask API for Finer's iOS styling experience. It builds outfits from quiz answer
 api_server.py
   ├── outfit_builder.py         quiz/chat/Today params, category guidance, catalog RPC fallback
   ├── chat_service.py           stylist replies and follow-up intent resolution
-  ├── product_search_service.py OpenAI query embeddings and semantic product search
+  ├── product_search_service.py hybrid semantic + structured catalog search
   ├── material_scan_service.py  Gemini material-family analysis with confidence gating
   ├── fit_image_service.py      fit persistence, Gemini image generation, personas, signed URLs
   └── push_service.py           APNs token auth and delivery
@@ -46,7 +46,7 @@ Routes are mounted at the server root; there is no `/api` prefix.
 | `GET` | `/fits?user_id=<uuid>` | List a user's fits with batched private signed image URLs |
 | `POST` | `/fits/generate-images` | Generate images for a new or existing fit and persist them |
 | `POST` | `/materials/scan` | Estimate a garment's basic material from one or two uploaded images |
-| `GET` | `/products/search?q=<text>&limit=20` | Semantic catalog search; `limit` is capped at 50 |
+| `GET` | `/products/search?q=<text>&limit=20` | Hybrid catalog search across concepts, categories, colors, and brands; `limit` is capped at 50 |
 | `GET` | `/products/<product_id>` | Product detail, materials, and sustainability substantiation |
 | `POST` | `/devices/register` | Upsert an APNs device token |
 | `POST` | `/admin/push/broadcast` | Send an admin-authenticated push to all or selected devices |
@@ -138,8 +138,38 @@ The cache key is `(user_id, local date, inferred occasion)`. On a cache miss the
 
 ```bash
 curl "http://localhost:8000/products/search?q=linen+shirt+for+summer&limit=10"
+curl "http://localhost:8000/products/search?q=black+Kowtow+jeans&limit=10"
 curl "http://localhost:8000/products/PRODUCT_ID"
 ```
+
+Product search expands broad garment concepts (for example, `pants` includes
+trousers, jeans, joggers, and leggings) before embedding. The hybrid Supabase
+function then combines vector similarity with exact catalog category/color
+matches and lexical brand matches. If OpenAI embeddings are temporarily
+unavailable, structured and lexical queries can still return results.
+
+Run the relevance gate after applying search migrations or deploying:
+
+```bash
+python scripts/evaluate_product_search.py \
+  --base-url https://finer-stylist-backend.onrender.com
+```
+
+It checks parent-category coverage plus exact brand, color, and combined-query
+behavior. A nonzero exit code means at least one relevance contract regressed.
+
+Safe rollout order:
+
+1. Apply `migrations/010_hybrid_product_search.sql` in Supabase.
+2. Deploy the backend with `SEARCH_RPC=match_products_hybrid`.
+3. Run the relevance gate above; all cases must pass.
+4. If relevance or latency regresses, set `SEARCH_RPC=match_products_semantic`
+   and redeploy. The legacy function remains intact, so rollback needs no
+   destructive database change.
+
+Re-embedding is not required for migration 010. The re-embedding script now
+includes brand and granular category text so the next catalog-wide refresh can
+improve the semantic candidate signal as well.
 
 The detail endpoint may return a `null` sustainability score when the available evidence is insufficient. Consumers should present the accompanying `data_completeness`, `score_version`, and `breakdown` instead of treating the score as an unsupported standalone judgment.
 
@@ -203,7 +233,8 @@ Most tests isolate external services with fixtures or monkeypatching. The manual
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `SEARCH_EMBED_MODEL` | `text-embedding-3-small` | Must match the catalog embedding model |
-| `SEARCH_RPC` | `match_products_semantic` | Supabase product-search function |
+| `SEARCH_RPC` | `match_products_hybrid` | Hybrid Supabase product-search function |
+| `LEGACY_SEARCH_RPC` | `match_products_semantic` | Safe fallback while the hybrid migration reaches Supabase |
 | `CHAT_MODEL` | `gpt-4o-mini` | Stylist reply and intent resolver model |
 | `MATERIAL_SCANNER_MODEL` | `gemini-3.6-flash` | Gemini model used by `POST /materials/scan` |
 | `COMPOSER_TIMEOUT_S` | `3.0` | Stylist reply timeout |
@@ -233,7 +264,7 @@ Required data objects include:
 
 - Catalog tables: `finer_products_omega` and `finer_products_chi`.
 - Outfit RPCs: `ff_build_outfit_v3` and `ff_build_outfit_chi`.
-- Semantic helpers: `finer_tag_embeddings`, `match_tags`, and `match_products_semantic`.
+- Search helpers: `finer_tag_embeddings`, `match_tags`, `match_products_semantic`, and `match_products_hybrid`.
 - Fit data: `user_fits`, `user_fit_images`, and `finer_daily_fits`.
 - Profiles and notifications: `user_profile`, `personas`, and `device_tokens`.
 - Storage: private `fit-images-private` and public `personas` buckets, unless overridden by environment variables.
@@ -247,6 +278,10 @@ Apply the migrations in `migrations/` as needed:
 | `004_product_semantic_search.sql` | Configure 1536-dimensional pgvector search and create `match_products_semantic` |
 | `005_device_tokens.sql` | Create the service-role-only APNs device registry |
 | `006_personas.sql` | Create the shared persona cache and its read policy |
+| `007_product_brand.sql` | Populate and return catalog brands |
+| `008_outfit_rpc_brand.sql` | Carry brands through the outfit RPC |
+| `009_gender_filtering.sql` | Apply one gender-filtering rule to search and outfit retrieval |
+| `010_hybrid_product_search.sql` | Combine semantic recall with category, color, brand, and lexical ranking |
 
 Before applying migration `004`, populate compatible catalog embeddings:
 

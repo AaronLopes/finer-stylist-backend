@@ -7,8 +7,9 @@ match_products_semantic RPC (migrations/004_product_semantic_search.sql) can
 rank the full catalog and the API server can embed queries with a cheap
 OpenAI call instead of a local torch model.
 
-Embedded text per product: title + slot + color + tags + image caption +
-description. ~45 tokens/row average → full catalog ≈ 1.1M tokens ≈ $0.02.
+Embedded text per product: title + brand + slot + category + color + tags +
+image caption + description. Brand/category are also handled lexically by the
+hybrid search RPC, but including them here improves semantic candidate recall.
 
 Usage:
     python scripts/reembed_omega_openai.py --dry-run      # show composed text, no writes
@@ -40,14 +41,19 @@ UPDATE_WORKERS = 8       # parallel per-row PATCH writes
 MAX_TEXT_CHARS = 4000    # guard against pathological descriptions
 
 TEXT_FIELDS = (
-    "product_id,product_title,product_slot,product_color,product_tags,"
-    "product_image_caption,product_description"
+    "product_id,product_title,product_brand,product_slot,product_category,"
+    "product_color,product_tags,product_image_caption,product_description"
 )
 
 
 def compose_text(row: dict) -> str:
     parts = [row.get("product_title") or ""]
-    for key in ("product_slot", "product_color"):
+    for key in (
+        "product_brand",
+        "product_slot",
+        "product_category",
+        "product_color",
+    ):
         if row.get(key):
             parts.append(row[key])
     tags = row.get("product_tags") or []

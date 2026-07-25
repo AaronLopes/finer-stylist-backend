@@ -7,6 +7,7 @@ contract the iOS Search tab depends on (finer-ios docs/backend-blanks.md).
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -178,3 +179,164 @@ def test_serializer_includes_slot_and_description_when_present():
     assert item["slot"] == "dress"
     assert item["category"] == "dress"
     assert item["description"] == "A flowy midi dress."
+
+
+def test_pants_intent_expands_to_multiple_bottom_categories():
+    from product_search_service import parse_search_intent
+
+    intent = parse_search_intent("pants")
+
+    assert intent.categories == ("pants", "jeans", "leggings")
+    assert intent.diversify_categories is True
+    assert "trousers" in intent.semantic_query
+    assert "jeans" in intent.semantic_query
+    assert intent.brand_query is None
+
+
+def test_specific_category_and_color_are_exact_facets():
+    from product_search_service import parse_search_intent
+
+    intent = parse_search_intent("black jeans")
+
+    assert intent.categories == ("jeans",)
+    assert intent.colors == ("black",)
+    assert intent.diversify_categories is False
+    assert intent.brand_query is None
+
+
+def test_bare_brand_is_required_without_a_static_brand_registry():
+    from product_search_service import parse_search_intent
+
+    intent = parse_search_intent("Kowtow")
+
+    assert intent.brand_query == "kowtow"
+    assert intent.brand_terms == ("kowtow",)
+    assert intent.require_brand is True
+
+
+def test_mixed_brand_category_and_color_keep_all_three_intents():
+    from product_search_service import parse_search_intent
+
+    intent = parse_search_intent("black Kowtow jeans")
+
+    assert intent.categories == ("jeans",)
+    assert intent.colors == ("black",)
+    assert intent.brand_query == "kowtow"
+    assert intent.brand_terms == ("kowtow",)
+    assert intent.require_brand is False
+
+
+def test_specific_phrase_does_not_leak_into_second_category():
+    from product_search_service import parse_search_intent
+
+    intent = parse_search_intent("navy dress pants")
+
+    assert intent.categories == ("pants",)
+    assert "dress" not in intent.categories
+    assert intent.colors == ("blue",)
+
+
+class _FakeRPCCall:
+    def __init__(self, outcome):
+        self.outcome = outcome
+
+    def execute(self):
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return SimpleNamespace(data=self.outcome)
+
+
+class _RecordingSupabase:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = []
+
+    def rpc(self, name, params):
+        self.calls.append((name, params))
+        return _FakeRPCCall(self.outcomes.pop(0))
+
+
+def _service_with(supabase_client, embedding=None, embedding_error=None):
+    from product_search_service import ProductSearchService
+
+    service = object.__new__(ProductSearchService)
+    service.supabase = supabase_client
+    if embedding_error:
+        service.embed_query = lambda _query: (_ for _ in ()).throw(embedding_error)
+    else:
+        service.embed_query = lambda _query: embedding or [0.1, 0.2, 0.3]
+    return service
+
+
+def test_service_passes_structured_intent_to_hybrid_rpc(monkeypatch):
+    import product_search_service
+
+    database = _RecordingSupabase([[{
+        "product_id": "p1",
+        "product_title": "Classic Jeans",
+        "product_brand": "Kowtowclothing",
+        "product_price_amount": 115,
+        "product_img_link": "https://img.example/jeans.jpg",
+        "product_link": "https://shop.example/jeans",
+        "product_slot": "bottom",
+        "product_category": "jeans",
+        "product_color": "black",
+        "similarity": 0.51,
+        "search_score": 1.2,
+    }]])
+    service = _service_with(database)
+    monkeypatch.setattr(product_search_service, "SEARCH_RPC", "match_products_hybrid")
+
+    results = service.search("black Kowtow jeans", limit=12, gender="feminine")
+
+    assert results[0]["category"] == "jeans"
+    assert results[0]["product_color"] == "black"
+    assert results[0]["search_score"] == 1.2
+    rpc_name, params = database.calls[0]
+    assert rpc_name == "match_products_hybrid"
+    assert params["match_count"] == 12
+    assert params["p_categories"] == ["jeans"]
+    assert params["p_colors"] == ["black"]
+    assert params["p_brand_query"] == "kowtow"
+    assert params["p_brand_terms"] == ["kowtow"]
+    assert params["p_gender"] == "feminine"
+
+
+def test_missing_hybrid_rpc_falls_back_to_legacy(monkeypatch):
+    import product_search_service
+
+    database = _RecordingSupabase(
+        [
+            RuntimeError("PGRST202: Could not find the function"),
+            [dict(FAKE_RESULT)],
+        ]
+    )
+    service = _service_with(database)
+    monkeypatch.setattr(product_search_service, "SEARCH_RPC", "match_products_hybrid")
+    monkeypatch.setattr(
+        product_search_service, "LEGACY_SEARCH_RPC", "match_products_semantic"
+    )
+
+    results = service.search("pants", limit=7)
+
+    assert results[0]["product_id"] == FAKE_RESULT["product_id"]
+    assert results[0]["similarity"] == FAKE_RESULT["similarity"]
+    assert database.calls[0][0] == "match_products_hybrid"
+    assert database.calls[1] == (
+        "match_products_semantic",
+        {"query_embedding": [0.1, 0.2, 0.3], "match_count": 7},
+    )
+
+
+def test_embedding_outage_still_calls_hybrid_lexical_search(monkeypatch):
+    import product_search_service
+
+    database = _RecordingSupabase([[dict(FAKE_RESULT)]])
+    service = _service_with(database, embedding_error=RuntimeError("OpenAI timeout"))
+    monkeypatch.setattr(product_search_service, "SEARCH_RPC", "match_products_hybrid")
+
+    results = service.search("red", limit=5)
+
+    assert results[0]["product_id"] == FAKE_RESULT["product_id"]
+    assert database.calls[0][1]["query_embedding"] is None
+    assert database.calls[0][1]["p_colors"] == ["red"]
