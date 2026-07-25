@@ -15,6 +15,10 @@ services:
         sync: false
       - key: OPENAI_API_KEY
         sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: MATERIAL_SCANNER_MODEL
+        value: gemini-3.6-flash
       # --- APNs push notifications (push_service.py) ---
       # APNS_KEY_PATH points at the Render Secret File holding the .p8 AuthKey,
       # uploaded under Dashboard → Environment → Secret Files as

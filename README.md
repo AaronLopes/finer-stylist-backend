@@ -1,6 +1,6 @@
 # Finer Stylist Backend
 
-Flask API for Finer's iOS styling experience. It builds outfits from quiz answers, chat prompts, or live Today context; searches and serves products from Supabase; persists and renders fits; caches shared style personas; and sends APNs push notifications.
+Flask API for Finer's iOS styling experience. It builds outfits from quiz answers, chat prompts, or live Today context; scans garments for likely materials; searches and serves products from Supabase; persists and renders fits; caches shared style personas; and sends APNs push notifications.
 
 ## Current capabilities
 
@@ -8,6 +8,7 @@ Flask API for Finer's iOS styling experience. It builds outfits from quiz answer
 - Omega-first catalog queries with automatic Chi fallback. Set `PRIMARY_RPC=chi` to reverse the priority.
 - Natural-language product search using OpenAI `text-embedding-3-small` embeddings and pgvector cosine similarity.
 - Product detail responses with material and provenance-bearing sustainability data.
+- Gemini 3.6 Flash material-family analysis from a garment photo, optional fabric close-up, and product context.
 - Persisted fits, Gemini-generated outfit images, optional selfie-based likeness, and private signed image URLs.
 - Shared post-quiz style personas cached by `gender|style|occasion|setting`.
 - APNs device registration and admin-gated broadcasts for sandbox and production devices.
@@ -19,6 +20,7 @@ api_server.py
   ├── outfit_builder.py         quiz/chat/Today params, category guidance, catalog RPC fallback
   ├── chat_service.py           stylist replies and follow-up intent resolution
   ├── product_search_service.py OpenAI query embeddings and semantic product search
+  ├── material_scan_service.py  Gemini material-family analysis with confidence gating
   ├── fit_image_service.py      fit persistence, Gemini image generation, personas, signed URLs
   └── push_service.py           APNs token auth and delivery
 ```
@@ -43,10 +45,31 @@ Routes are mounted at the server root; there is no `/api` prefix.
 | `POST` | `/fits` | Persist a fit without generating images |
 | `GET` | `/fits?user_id=<uuid>` | List a user's fits with batched private signed image URLs |
 | `POST` | `/fits/generate-images` | Generate images for a new or existing fit and persist them |
+| `POST` | `/materials/scan` | Estimate a garment's basic material from one or two uploaded images |
 | `GET` | `/products/search?q=<text>&limit=20` | Semantic catalog search; `limit` is capped at 50 |
 | `GET` | `/products/<product_id>` | Product detail, materials, and sustainability substantiation |
 | `POST` | `/devices/register` | Upsert an APNs device token |
 | `POST` | `/admin/push/broadcast` | Send an admin-authenticated push to all or selected devices |
+
+### Material Scanner
+
+Send a garment photo as `multipart/form-data`. A fabric close-up and product
+context are optional. Visual scans return likely fibers and a confidence-aware
+material family; they do not claim exact blend percentages.
+
+```bash
+curl -X POST http://localhost:8000/materials/scan \
+  -F "image=@/path/to/garment.jpg" \
+  -F "texture_image=@/path/to/fabric-closeup.jpg" \
+  -F "brand=Everlane" \
+  -F "garment_type=shirt" \
+  -F "product_name=Relaxed Linen Shirt" \
+  -F "style_code=ABC-123"
+```
+
+The optional text fields are `brand`, `garment_type`, `product_name`,
+`style_code`, and `label_text`. Each image may be JPEG, PNG, WebP, HEIC, or
+HEIF and is limited to 6 MB.
 
 ### Quiz outfit
 
@@ -170,7 +193,7 @@ Most tests isolate external services with fixtures or monkeypatching. The manual
 | `SUPABASE_URL` | Yes | — | Supabase project URL |
 | `SUPABASE_KEY` | Yes | — | Service-role key used by the backend |
 | `OPENAI_API_KEY` | Yes | — | Chat parsing/composition, tag matching, and product-search embeddings |
-| `GEMINI_API_KEY` | For images/personas | — | Gemini outfit and persona image generation |
+| `GEMINI_API_KEY` | For images/personas/scans | — | Gemini outfit generation and Material Scanner analysis |
 | `PORT` | No | `10000` | Development server port; Render supplies this value |
 | `FLASK_DEBUG` | No | `false` | Enable Flask debug mode |
 | `PRIMARY_RPC` | No | `omega` | Catalog priority: `omega` or `chi` |
@@ -182,6 +205,7 @@ Most tests isolate external services with fixtures or monkeypatching. The manual
 | `SEARCH_EMBED_MODEL` | `text-embedding-3-small` | Must match the catalog embedding model |
 | `SEARCH_RPC` | `match_products_semantic` | Supabase product-search function |
 | `CHAT_MODEL` | `gpt-4o-mini` | Stylist reply and intent resolver model |
+| `MATERIAL_SCANNER_MODEL` | `gemini-3.6-flash` | Gemini model used by `POST /materials/scan` |
 | `COMPOSER_TIMEOUT_S` | `3.0` | Stylist reply timeout |
 | `RESOLVER_TIMEOUT_S` | `2.5` | Follow-up intent resolution timeout |
 | `FIT_IMAGES_BUCKET` | `fit-images-private` | Private generated-fit image bucket |

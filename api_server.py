@@ -11,6 +11,7 @@ Endpoints:
     POST /api/outfit/build     - Build outfit from quiz or chat
     POST /api/outfit/swap      - Swap single item in outfit
     POST /api/chat/parse       - Parse chat query (preview what we understood)
+    POST /materials/scan       - Estimate a garment's basic material
     GET  /products/search      - Semantic product search (iOS Search tab)
     GET  /products/<id>        - Single product detail + sustainability score
     GET  /api/health           - Health check
@@ -41,6 +42,7 @@ load_dotenv()
 
 from chat_service import get_chat_composer, get_chat_resolver
 from fit_image_service import FitImageService
+from material_scan_service import MaterialScanError, MaterialScanService
 from outfit_builder import OutfitBuilder, _rpc_gender, _stable_hash, create_outfit_builder
 from product_search_service import ProductSearchService
 from push_service import get_push_service
@@ -57,9 +59,18 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # Initialize outfit builder (lazy loading)
 _outfit_builder: Optional[OutfitBuilder] = None
 _fit_image_service: Optional[FitImageService] = None
+_material_scan_service: Optional[MaterialScanService] = None
 _product_search_service: Optional[ProductSearchService] = None
 
 MAX_SEARCH_LIMIT = 50
+MAX_MATERIAL_IMAGE_BYTES = 6 * 1024 * 1024
+MATERIAL_IMAGE_MIME_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/heic",
+    "image/heif",
+}
 
 
 def get_outfit_builder() -> OutfitBuilder:
@@ -74,6 +85,13 @@ def get_fit_image_service() -> FitImageService:
     if _fit_image_service is None:
         _fit_image_service = FitImageService()
     return _fit_image_service
+
+
+def get_material_scan_service() -> MaterialScanService:
+    global _material_scan_service
+    if _material_scan_service is None:
+        _material_scan_service = MaterialScanService()
+    return _material_scan_service
 
 
 def get_product_search_service() -> ProductSearchService:
@@ -231,6 +249,133 @@ def validate_swap_request(data: Dict[str, Any]) -> tuple[bool, str]:
 # =============================================================================
 
 
+def _read_material_image(field_name: str, *, required: bool):
+    uploaded = request.files.get(field_name)
+    if uploaded is None:
+        if required:
+            return None, f"Missing required image field: {field_name}"
+        return None, None
+
+    mime_type = (uploaded.mimetype or "").lower()
+    if mime_type not in MATERIAL_IMAGE_MIME_TYPES:
+        return (
+            None,
+            f"Unsupported {field_name} type. Use JPEG, PNG, WebP, HEIC, or HEIF.",
+        )
+
+    image_bytes = uploaded.stream.read(MAX_MATERIAL_IMAGE_BYTES + 1)
+    if not image_bytes:
+        return None, f"{field_name} is empty."
+    if len(image_bytes) > MAX_MATERIAL_IMAGE_BYTES:
+        return None, f"{field_name} exceeds the 6 MB limit."
+    return (image_bytes, mime_type), None
+
+
+def _material_form_value(name: str, max_length: int) -> Optional[str]:
+    value = request.form.get(name)
+    if value is None:
+        return None
+    value = value.strip()
+    return value[:max_length] or None
+
+
+@app.route("/materials/scan", methods=["POST"])
+def scan_material():
+    """Estimate a garment's basic material from one or two uploaded images."""
+    if not request.mimetype or not request.mimetype.startswith("multipart/form-data"):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "scan": None,
+                    "error": "Use multipart/form-data with an image field.",
+                }
+            ),
+            400,
+        )
+
+    image, image_error = _read_material_image("image", required=True)
+    if image_error:
+        return jsonify({"success": False, "scan": None, "error": image_error}), 400
+
+    texture_image, texture_error = _read_material_image(
+        "texture_image", required=False
+    )
+    if texture_error:
+        return (
+            jsonify({"success": False, "scan": None, "error": texture_error}),
+            400,
+        )
+
+    context = {
+        "brand": _material_form_value("brand", 120),
+        "garment_type": _material_form_value("garment_type", 120),
+        "product_name": _material_form_value("product_name", 180),
+        "style_code": _material_form_value("style_code", 120),
+        "label_text": _material_form_value("label_text", 2000),
+    }
+    logger.info(
+        "/materials/scan request texture_image=%s metadata_fields=%s",
+        texture_image is not None,
+        [key for key, value in context.items() if value],
+    )
+
+    try:
+        service = get_material_scan_service()
+        scan = service.analyze(
+            image,
+            texture_image=texture_image,
+            **context,
+        )
+        return (
+            jsonify(
+                {
+                    "success": True,
+                    "scan": scan,
+                    "model": service.model,
+                    "error": None,
+                }
+            ),
+            200,
+        )
+    except MaterialScanError as exc:
+        logger.warning("/materials/scan Gemini failure: %s", exc)
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "scan": None,
+                    "error": "Material analysis is temporarily unavailable.",
+                }
+            ),
+            502,
+        )
+    except RuntimeError as exc:
+        logger.error("/materials/scan configuration failure: %s", exc)
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "scan": None,
+                    "error": "Material Scanner is not configured.",
+                }
+            ),
+            503,
+        )
+    except Exception:
+        logger.exception("/materials/scan unexpected failure")
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "scan": None,
+                    "error": "Material analysis failed.",
+                }
+            ),
+            500,
+        )
+
+
 @app.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint with environment and connection validation."""
@@ -243,7 +388,7 @@ def health_check():
     all_ok = True
 
     # Check environment variables exist
-    env_vars = ["SUPABASE_URL", "SUPABASE_KEY", "OPENAI_API_KEY"]
+    env_vars = ["SUPABASE_URL", "SUPABASE_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"]
     for var in env_vars:
         value = os.getenv(var)
         if value:
