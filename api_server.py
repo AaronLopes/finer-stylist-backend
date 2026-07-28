@@ -14,6 +14,7 @@ Endpoints:
     POST /materials/scan       - Estimate a garment's basic material
     GET  /products/search      - Hybrid product search (iOS Search tab)
     GET  /products/<id>        - Single product detail + sustainability score
+    GET  /geo                  - Coarse IP geolocation (onboarding "Just launched in <city>")
     GET  /api/health           - Health check
 
 Usage:
@@ -27,10 +28,15 @@ Environment Variables Required:
     - OPENAI_API_KEY
 """
 
+import base64
+import binascii
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+
+import requests as http_requests
 
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
@@ -430,6 +436,65 @@ def health_check():
     return jsonify(checks), 200 if all_ok else 503
 
 
+# --- IP geolocation (landing-page "Just launched in <city>") -----------------
+# ip-api.com free tier: HTTP-only, ~45 req/min per source IP. The per-IP cache
+# keeps repeat lookups off the wire; swap to https://ipapi.co/<ip>/json/ if the
+# rate limit ever bites.
+_GEO_CACHE: Dict[str, Dict[str, Any]] = {}
+_GEO_CACHE_LOCK = threading.Lock()
+_GEO_CACHE_MAX = 2000
+
+
+def _client_ip() -> str:
+    """First hop of X-Forwarded-For (Render sits behind a proxy), else remote_addr."""
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.remote_addr or ""
+
+
+@app.route("/geo", methods=["GET"])
+def geo_lookup():
+    """Coarse city lookup from the caller's IP for onboarding copy.
+
+    Never errors hard: any failure returns HTTP 200 {"success": false} and the
+    client hides the "Just launched in <city>" line.
+    """
+    ip = _client_ip()
+    if not ip or ip in ("127.0.0.1", "::1") or ip.startswith(("10.", "192.168.", "172.")):
+        return jsonify({"success": False, "error": "No public client IP"}), 200
+
+    with _GEO_CACHE_LOCK:
+        cached = _GEO_CACHE.get(ip)
+    if cached:
+        return jsonify(cached)
+
+    try:
+        resp = http_requests.get(
+            f"http://ip-api.com/json/{ip}",
+            params={"fields": "status,city,region,countryCode"},
+            timeout=3,
+        )
+        data = resp.json()
+        if data.get("status") != "success" or not data.get("city"):
+            return jsonify({"success": False, "error": "Lookup failed"}), 200
+        payload = {
+            "success": True,
+            "city": data["city"],
+            "region": data.get("region"),
+            "country": data.get("countryCode"),
+        }
+    except Exception:
+        logger.warning("geo lookup failed for %s", ip, exc_info=True)
+        return jsonify({"success": False, "error": "Lookup failed"}), 200
+
+    with _GEO_CACHE_LOCK:
+        if len(_GEO_CACHE) >= _GEO_CACHE_MAX:
+            _GEO_CACHE.clear()
+        _GEO_CACHE[ip] = payload
+    return jsonify(payload)
+
+
 @app.route("/outfit/build", methods=["POST"])
 def build_outfit():
     """
@@ -806,6 +871,125 @@ def resolve_persona():
         return jsonify({"success": True, "cached": False, **persona})
     except Exception as e:
         logger.exception("Persona create failed key=%s error=%s", key, e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/persona/personalize", methods=["POST"])
+def personalize_persona():
+    """Re-render the caller's style persona with their own face (Precision Fit).
+
+    Resolves the generic persona first (same get-or-create path as
+    /persona/resolve — so the personalized render wears the SAME outfit), then
+    renders one image with the selfie as the likeness reference. The result is
+    per-user: it is stored in the private user-selfies bucket under
+    {client_id}/persona-<key>.png and returned as a signed URL — it never
+    touches the shared personas cache. No auth required — this runs during
+    onboarding before the user has an account, so the selfie arrives as inline
+    base64 (selfie_data); the post-auth lazy path sends selfie_url instead.
+
+    Expected payload: quiz answers ({gender, occasion, weather, setting, goals,
+    style, budget}) plus:
+      client_id    (required) auth uid or vendor UUID — storage namespace
+      selfie_data  base64-encoded JPEG bytes (no data-URI prefix), OR
+      selfie_url   signed URL of the uploaded selfie
+      selfie_mime  optional, defaults to image/jpeg
+
+    Response:
+    {
+      "success": true,
+      "persona_key": "masculine|classic|work|city",
+      "title": "The Classic",
+      "subtitle": null,
+      "image_url": "https://.../storage/v1/object/sign/user-selfies/....png?token=...",
+      "image_path": "<client_id>/persona-masculine_classic_work_city.png",
+      "items": [{ id, slot, name, brand, price, imageUrl, link }, ...]
+    }
+    """
+    data = request.get_json()
+    if not data:
+        logger.warning("/persona/personalize missing JSON payload")
+        return jsonify({"success": False, "error": "No JSON payload provided"}), 400
+
+    valid, error = validate_quiz_answers(data)
+    if not valid:
+        logger.warning("/persona/personalize validation failed: %s", error)
+        return jsonify({"success": False, "error": error}), 400
+
+    client_id = (data.get("client_id") or "").strip()
+    if not client_id:
+        return (
+            jsonify({"success": False, "error": "Missing required field: client_id"}),
+            400,
+        )
+
+    selfie_data = data.get("selfie_data")
+    selfie_url = data.get("selfie_url") or None
+    selfie_inline = None
+    if selfie_data:
+        try:
+            base64.b64decode(selfie_data, validate=True)
+        except (binascii.Error, ValueError):
+            return (
+                jsonify({"success": False, "error": "selfie_data is not valid base64"}),
+                400,
+            )
+        selfie_inline = {
+            "mimeType": data.get("selfie_mime") or "image/jpeg",
+            "data": selfie_data,
+        }
+    if not selfie_inline and not selfie_url:
+        return (
+            jsonify(
+                {"success": False, "error": "Provide one of selfie_data or selfie_url"}
+            ),
+            400,
+        )
+
+    service = get_fit_image_service()
+    key = service.persona_key(data)
+    logger.info(
+        "/persona/personalize key=%s client=%s has_inline=%s",
+        key,
+        client_id,
+        selfie_inline is not None,
+    )
+
+    # Resolve the generic persona (cache hit or create) so the personalized
+    # render reuses the exact same outfit items.
+    try:
+        persona = service.get_persona(key)
+    except Exception as e:
+        logger.exception("Persona lookup failed key=%s error=%s", key, e)
+        persona = None
+
+    try:
+        if not persona:
+            builder = get_outfit_builder()
+            outfit = builder.build_from_quiz(data)
+            items = outfit.get("items", {}) or {}
+            if not any(v is not None for v in items.values()):
+                return (
+                    jsonify({"success": False, "error": "Could not build an outfit"}),
+                    502,
+                )
+            persona = service.create_persona(key, data, items)
+
+        personalized = service.personalize_persona(
+            persona=persona,
+            profile=data,
+            client_id=client_id,
+            selfie_inline=selfie_inline,
+            selfie_url=selfie_url,
+        )
+        logger.info("/persona/personalize DONE key=%s client=%s", key, client_id)
+        return jsonify({"success": True, **personalized})
+    except ValueError as e:
+        # personalize_persona raises when the selfie can't be loaded — a
+        # generic image must never come back labeled as personalized.
+        logger.warning("/persona/personalize bad selfie key=%s: %s", key, e)
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        logger.exception("Persona personalize failed key=%s error=%s", key, e)
         return jsonify({"success": False, "error": str(e)}), 500
 
 

@@ -42,6 +42,7 @@ Routes are mounted at the server root; there is no `/api` prefix.
 | `POST` | `/chat/parse` | Preview the structured outfit parameters inferred from a chat prompt |
 | `POST` | `/chat/resolve-intent` | Resolve an ambiguous follow-up into a standalone outfit query |
 | `POST` | `/persona/resolve` | Get or create a cached post-quiz style persona |
+| `POST` | `/persona/personalize` | Re-render the caller's persona with their selfie (Precision Fit); stored per-user in `user-selfies`, signed URL |
 | `POST` | `/fits` | Persist a fit without generating images |
 | `GET` | `/fits?user_id=<uuid>` | List a user's fits with batched private signed image URLs |
 | `POST` | `/fits/generate-images` | Generate images for a new or existing fit and persist them |
@@ -282,6 +283,7 @@ Apply the migrations in `migrations/` as needed:
 | `008_outfit_rpc_brand.sql` | Carry brands through the outfit RPC |
 | `009_gender_filtering.sql` | Apply one gender-filtering rule to search and outfit retrieval |
 | `010_hybrid_product_search.sql` | Combine semantic recall with category, color, brand, and lexical ranking |
+| `011_user_saved_items.sql` | Record the existing Saved table and restrict each user to their own rows |
 
 Before applying migration `004`, populate compatible catalog embeddings:
 

@@ -22,6 +22,9 @@ FIT_IMAGES_BUCKET = os.getenv("FIT_IMAGES_BUCKET", "fit-images-private")
 SIGNED_URL_TTL_SECONDS = int(os.getenv("FIT_SIGNED_URL_TTL_SECONDS", "604800"))
 # Public bucket for shared style personas (see migrations/006_personas.sql).
 PERSONAS_BUCKET = os.getenv("PERSONAS_BUCKET", "personas")
+# Private per-user bucket (selfies + personalized persona renders). Folders are
+# keyed by client id; RLS is defined in the iOS repo's docs/sql/selfie-profile.sql.
+SELFIES_BUCKET = os.getenv("SELFIES_BUCKET", "user-selfies")
 
 # Curated display names per style aesthetic for the persona card.
 _PERSONA_TITLES = {
@@ -320,6 +323,57 @@ class FitImageService:
 
         return self._persona_response(row)
 
+    def personalize_persona(
+        self,
+        persona: Dict[str, Any],
+        profile: Dict[str, Any],
+        client_id: str,
+        selfie_inline: Optional[Dict[str, str]] = None,
+        selfie_url: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Re-render an already-resolved persona with the user's face.
+
+        `persona` is the /persona/resolve response shape — its items are reused
+        verbatim so the personalized render wears the SAME outfit as the generic
+        card. The image goes to the private user-selfies bucket next to the
+        selfie it derives from ({client_id}/persona-<key>.png, upserted), never
+        the shared public personas cache. Raises ValueError when no usable
+        selfie is available — a generic image must never be returned as "you".
+        """
+        face_inline = None
+        if selfie_inline and selfie_inline.get("data"):
+            face_inline = selfie_inline
+        elif selfie_url:
+            face_inline = self._convert_image_to_inline_data(selfie_url)
+        if not face_inline:
+            raise ValueError("Could not load selfie")
+
+        items_list = persona.get("items") or []
+        slots = self._extract_slots(items_list)
+
+        generated = self._generate_images(
+            top_image=slots.get("top") or "",
+            bottom_image=slots.get("bottom") or "",
+            shoes_image=slots.get("shoes") or "",
+            profile=profile or {},
+            count=1,
+            selfie_inline=face_inline,
+        )
+
+        key = persona.get("persona_key") or self.persona_key(profile)
+        image_path = f"{client_id}/persona-{key.replace('|', '_')}.png"
+        self._upload_to_storage(image_path, generated[0], bucket=SELFIES_BUCKET)
+        image_url = self._create_signed_url(image_path, bucket=SELFIES_BUCKET)
+
+        return {
+            "persona_key": key,
+            "title": persona.get("title"),
+            "subtitle": persona.get("subtitle"),
+            "image_url": image_url,
+            "image_path": image_path,
+            "items": items_list,
+        }
+
     def _persona_items(self, items: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Flatten the builder's slot->product dict into the fit-item shape
         (slot + imageUrl + display fields) used for rendering and shop-the-look."""
@@ -491,6 +545,7 @@ class FitImageService:
         profile: Dict[str, Any],
         count: int,
         selfie_url: Optional[str] = None,
+        selfie_inline: Optional[Dict[str, str]] = None,
         occasion: Optional[str] = None,
     ) -> List[bytes]:
         available = [url for url in [top_image, bottom_image, shoes_image] if url]
@@ -498,10 +553,14 @@ class FitImageService:
             raise ValueError("Need at least one image URL to generate fit images")
 
         # Precision Fit: when a selfie is supplied, load it as the FIRST image
-        # part so the prompt can reference it as the person's face/likeness. If
-        # it fails to load we silently fall back to a generic model.
+        # part so the prompt can reference it as the person's face/likeness.
+        # selfie_inline ({mimeType, data}) wins over selfie_url — the guest
+        # persona flow sends bytes directly since nothing is uploaded yet. If
+        # the URL fails to load we silently fall back to a generic model.
         face_part = None
-        if selfie_url:
+        if selfie_inline and selfie_inline.get("data"):
+            face_part = {"inlineData": selfie_inline}
+        elif selfie_url:
             face_inline = self._convert_image_to_inline_data(selfie_url)
             if face_inline:
                 face_part = {"inlineData": face_inline}
@@ -627,10 +686,9 @@ class FitImageService:
                 f"Storage upload failed ({response.status_code}): {response.text[:250]}"
             )
 
-    def _create_signed_url(self, image_path: str) -> str:
-        sign_url = (
-            f"{SUPABASE_URL}/storage/v1/object/sign/{FIT_IMAGES_BUCKET}/{image_path}"
-        )
+    def _create_signed_url(self, image_path: str, bucket: Optional[str] = None) -> str:
+        bucket = bucket or FIT_IMAGES_BUCKET
+        sign_url = f"{SUPABASE_URL}/storage/v1/object/sign/{bucket}/{image_path}"
         headers = {
             "Authorization": f"Bearer {SUPABASE_KEY}",
             "apikey": SUPABASE_KEY,
