@@ -267,7 +267,8 @@ Required data objects include:
 - Outfit RPCs: `ff_build_outfit_v3` and `ff_build_outfit_chi`.
 - Search helpers: `finer_tag_embeddings`, `match_tags`, `match_products_semantic`, and `match_products_hybrid`.
 - Fit data: `user_fits`, `user_fit_images`, and `finer_daily_fits`.
-- Profiles and notifications: `user_profile`, `personas`, and `device_tokens`.
+- Profiles, Closet, and notifications: `user_profile`, `user_saved_items`,
+  `personas`, and `device_tokens`.
 - Storage: private `fit-images-private` and public `personas` buckets, unless overridden by environment variables.
 
 Apply the migrations in `migrations/` as needed:
