@@ -25,6 +25,9 @@ PERSONAS_BUCKET = os.getenv("PERSONAS_BUCKET", "personas")
 # Private per-user bucket (selfies + personalized persona renders). Folders are
 # keyed by client id; RLS is defined in the iOS repo's docs/sql/selfie-profile.sql.
 SELFIES_BUCKET = os.getenv("SELFIES_BUCKET", "user-selfies")
+# Gemini image model for all fit/persona renders. Overridable so a newer,
+# faster model can be rolled out (or rolled back) with just an env change.
+FIT_IMAGE_MODEL = os.getenv("FIT_IMAGE_MODEL", "gemini-2.5-flash-image")
 
 # Curated display names per style aesthetic for the persona card.
 _PERSONA_TITLES = {
@@ -592,11 +595,13 @@ class FitImageService:
                     {
                         "parts": [{"text": prompt}, *image_parts],
                     }
-                ]
+                ],
+                # Required by Gemini 3.x image models; accepted by 2.5 too
+                "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
             }
             t0 = time.monotonic()
             resp = requests.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{FIT_IMAGE_MODEL}:generateContent",
                 params={"key": GEMINI_API_KEY},
                 json=payload,
                 timeout=120,
