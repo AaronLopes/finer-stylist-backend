@@ -327,9 +327,10 @@ Andrea provides free advice/outfit chat, a one-time welcome, and three successfu
 photo ratings per account before Pro. Conversations are client-held and resettable;
 source photos are never stored. The existing outfit builder supplies catalog looks.
 Legacy routes and existing image generation remain unchanged. Photo ratings use
-only an explicit per-photo occasion for dress code; saved quiz occasion, setting,
-weather, season, and budget are excluded from assessment context. Rubric v1.1
-retains optional style/goals preferences without requiring a saved persona.
+only the photo and an explicit per-photo occasion. Saved quiz/profile values are
+excluded from assessment context: both old occasions and personas biased scores
+during preview QA. Rubric v1.2 judges the style visible in the photo; users can
+specify an intended occasion or style in the optional context field.
 
 - `POST /andrea/chat`: JSON message/history/profile plus optional outfit/rating context.
   Guest text is supported; invalid supplied auth is rejected. Returns advice or an
