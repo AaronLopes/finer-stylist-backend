@@ -208,3 +208,21 @@ def test_superwall_lookup_uses_server_credentials_and_existing_ios_identity(monk
     assert SuperwallEntitlements().is_pro(UID)
     assert UID.upper() in calls[0][0]
     assert calls[0][1]['params']=={'application_id':'42'}
+
+
+def test_date_reply_returns_card_payload_and_refinement_actions(setup):
+    c,s,a,e,builds=setup
+    a.chat=lambda *args: {'kind':'outfit','outfit_query':'Build an outfit for date.','reply_text':''}
+    r=c.post('/andrea/chat',json={
+        'message':'Date',
+        'profile':{'occasion':'work','style':'classic'},
+        'history':[{'role':'user','content':'Help me build a look. Ask me where I am headed.'},
+                   {'role':'assistant','content':'Where are you headed for work?'}]})
+    assert r.status_code==200
+    assert r.json['kind']=='outfit'
+    assert r.json['outfit']['success'] is True
+    assert r.json['outfit']['items']['top']['product_title']=='Jacket'
+    assert r.json['outfit_query']=='Build an outfit for date.'
+    assert builds==[('Build an outfit for date.',)]
+    assert len(r.json['actions'])==3
+    assert all(action['id']=='message' and 'same occasion' in action['message'] for action in r.json['actions'])

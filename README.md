@@ -330,7 +330,12 @@ Legacy routes and existing image generation remain unchanged.
 
 - `POST /andrea/chat`: JSON message/history/profile plus optional outfit/rating context.
   Guest text is supported; invalid supplied auth is rejected. Returns advice or an
-  outfit with assistant copy and typed actions.
+  outfit with concise assistant copy, three typed refinement actions, and an
+  `outfit_query` that clients retain alongside the item summary for follow-ups.
+  Outfit-building answers (including short occasion replies) render catalog cards;
+  the current occasion overrides saved profile defaults. Conversation turns are
+  sent with their actual roles. General explanations and photo-rating follow-ups
+  remain advice rather than creating an unwanted shopping look.
 - `GET /andrea/state`, `POST /andrea/welcome/read`: authenticated account allowance,
   welcome-read status, trusted Pro status, and rating availability.
 - `POST /andrea/ratings`: authenticated multipart UUID `request_id`, `image`

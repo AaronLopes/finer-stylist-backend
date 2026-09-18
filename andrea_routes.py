@@ -203,9 +203,10 @@ def register_andrea_routes(app, builder_provider, supabase_provider, *, service_
         except Exception: reply='Here is the look I put together for you.'
         if not any(outfit.get('items',{}).values()):
             return jsonify(success=True,kind='advice',reply_text="I couldn't find the right pieces. Try another occasion or style direction.",actions=[])
-        return jsonify(success=True,kind='outfit',reply_text=reply,outfit=outfit,
-            actions=[{'id':'message','label':'Make it more casual','message':'Make this outfit more casual'},
-                     {'id':'message','label':'Try another look','message':'Build another outfit for the same occasion'}])
+        return jsonify(success=True,kind='outfit',reply_text=reply,outfit=outfit,outfit_query=query,
+            actions=[{'id':'message','label':'More casual','message':'Build a more casual version of this outfit for the same occasion'},
+                     {'id':'message','label':'Different top','message':'Build another version of this outfit with a different top for the same occasion'},
+                     {'id':'message','label':'Another look','message':'Build another outfit for the same occasion'}])
 
     @bp.get('/ratings/<rid>')
     def get_rating(rid):

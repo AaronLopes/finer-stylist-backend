@@ -55,9 +55,9 @@ class AndreaService:
         self.chat_model = os.getenv('ANDREA_CHAT_MODEL', 'gpt-4o-mini')
         self.rating_model = os.getenv('ANDREA_RATING_MODEL', 'gpt-4.1-mini')
 
-    def _json(self, model, system, content, max_tokens):
+    def _json(self, model, system, content, max_tokens, history=None):
         response = self.client.chat.completions.create(model=model,
-            messages=[{'role':'system','content':system},{'role':'user','content':content}],
+            messages=[{'role':'system','content':system}, *(history or []), {'role':'user','content':content}],
             response_format={'type':'json_object'}, max_tokens=max_tokens, temperature=0.3)
         usage = response.usage
         logger.info('Andrea model=%s input_tokens=%s output_tokens=%s', model,
@@ -70,22 +70,48 @@ class AndreaService:
         return value
 
     def chat(self, message, history, profile, outfit_context, rating_context):
-        prompt = STYLE_RULES + """
-Return JSON {"kind":"advice" or "outfit", "reply_text":"...", "outfit_query":"..."}.
-Use outfit ONLY when the user asks you to build/rebuild/find an outfit or replace a
-catalog item. Resolve short follow-ups using the supplied history and outfit context.
-Use advice for questions, explanations, greetings, photo-rating discussion, and
-help styling a specific owned item unless they request shopping/outfit suggestions.
-If an image is needed, invite them to tap the camera; never pretend you can see it.
-If the user asks you to ask questions first, use advice. For outfit return a
-self-contained outfit_query <=600 characters that preserves the occasion, dress
-code, style, budget, and user constraints. Do not replace an occasion with only
-a shopping list. Never invent gender preferences when none are supplied. For advice return
-helpful reply_text <=110 words. Use only supplied observations for rating follow-ups.
-Ask a useful clarification if required. Never produce a numeric photo rating from text.
+        prompt = """Choose the next UI response for Finer's Andrea stylist.
+Return JSON {"kind":"outfit" or "advice", "outfit_query":"", "reply_text":""}.
+
+OUTFIT means render real catalog product cards. Choose it for ALL requests for
+something to wear, including "What should I wear on a first date?", "Date" after
+"Where are you headed?", and "More casual" / "Different shirt" after an outfit.
+Also choose outfit when a user answers a clarification about building a look.
+For outfit: reply_text MUST be empty. Write a standalone plain-language outfit_query
+(max 600 characters) for the catalog builder. Keep the current occasion, owned
+items, budget and constraints from the conversation. Never invent budget/weather.
+The newest request wins over earlier messages and saved profile defaults.
+Example: saved occasion=work, latest user="Date" -> outfit_query for a DATE.
+
+ADVICE is ONLY greetings, general fashion explanations, why a look works, or
+follow-ups about an already rated photograph. A photo's occasion answer stays
+advice only when the latest conversation is about that photo; an old last_rating
+must not prevent a NEW outfit-building conversation from producing an outfit.
+If the CURRENT user explicitly asks you to ask where they are headed first, ask
+that one question. Once they answer, build. Old instructions to ask questions
+are already fulfilled. If needed, ask at most one essential clarification.
+For advice: outfit_query MUST be empty. Reply in 1-3 short sentences (<=60 words).
+Never answer a request for something to wear with a prose-only shopping list.
+Never assign or revise numeric photo ratings from text.
+
+Only when writing advice, use this voice and styling guidance:
+""" + STYLE_RULES
+        if rating_context:
+            prompt += """
+RATING CONTEXT ROUTING EXAMPLES (follow the latest conversation):
+- Assistant: "What occasion was the rated outfit for?" User: "Date"
+  -> {"kind":"advice","outfit_query":"","reply_text":"For a date, the navy jacket and trousers give you a cohesive base."}
+- User: "Help me build a NEW look. Ask me where I am headed."
+  Assistant: "Where are you headed?" User: "Date"
+  -> {"kind":"outfit","outfit_query":"Build a new outfit for a date.","reply_text":""}
+A new build request supersedes the old photo discussion. Otherwise, an answer to
+an explicit question about the RATED outfit evaluates that existing outfit only.
 """
-        value = self._json(self.chat_model,prompt,json.dumps({'message':message,'recent_messages':history,
-            'profile':profile,'current_outfit':outfit_context,'last_rating':rating_context}),600)
+        context = {'profile_defaults': profile, 'current_outfit': outfit_context, 'last_rating': rating_context}
+        # Keep conversation roles and the latest user turn explicit. A JSON blob
+        # made old starter instructions and saved occasions compete with the reply.
+        turns = [{'role': 'user', 'content': 'Background context only: ' + json.dumps(context)}, *history]
+        value = self._json(self.chat_model, prompt, message, 400, history=turns)
         if value.get('kind') not in ('advice','outfit'):
             raise ValueError('Invalid chat route')
         if value['kind']=='outfit' and not short_text(value.get('outfit_query'),600):
@@ -98,10 +124,13 @@ Ask a useful clarification if required. Never produce a numeric photo rating fro
         fields = ['product_title','product_color','product_texture','product_formality','product_role','product_slot']
         items = {slot:{k:p.get(k) for k in fields} for slot,p in outfit.get('items',{}).items() if isinstance(p,dict)}
         value = self._json(self.chat_model, STYLE_RULES + """
-Explain this actual selected outfit in <=80 words. Reference 1-2 actual items and
-one supported styling reason. Do not invent rationale when metadata is missing.
+Describe this actual selected outfit in two short sentences, <=50 words total.
+First introduce the look using 1-2 actual item names. Then explain one supported
+styling reason: this second sentence appears under "Why this works" in the card.
+The built outfit/request is authoritative; ignore conflicting saved profile occasion.
+Do not invent rationale when metadata is missing.
 Return JSON {"reply_text":"..."}. No prices unless the user asked about budget.
-""",json.dumps({'query':query,'items':items,'profile':profile}),220)
+""",json.dumps({'query':query,'items':items,'profile':profile}),180)
         return short_text(value.get('reply_text'),1000) or 'Here is the look I put together for you.'
 
     def rate(self, image, occasion, profile):
