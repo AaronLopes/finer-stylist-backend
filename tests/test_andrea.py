@@ -272,3 +272,16 @@ def test_preview_can_be_disabled_and_still_recover_existing_results(setup,monkey
     recovered=c.get('/andrea/ratings/'+rid,headers={'Authorization':'Bearer valid'})
     assert recovered.status_code==200 and recovered.json['rating']['score']==8
     assert not recovered.json['state']['ratings_enabled'] and a.calls==1
+
+
+@pytest.mark.parametrize('occasion',['', 'Office presentation'])
+def test_rating_uses_only_explicit_occasion_not_saved_quiz_context(occasion):
+    import json
+    calls=[]
+    def create(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(usage=None,choices=[SimpleNamespace(finish_reason='stop',message=SimpleNamespace(content=json.dumps(RATING)))])
+    svc=AndreaService(client=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))))
+    svc.rate(b'jpeg',occasion,{'occasion':'work','setting':'suburbs','weather':['cold'],'season':'winter','style':'bohemian','goals':['inspired'],'budget':'expensive'})
+    payload=json.loads(calls[0]['messages'][1]['content'][0]['text'])
+    assert payload=={'occasion':occasion,'style_preferences':{'style':'bohemian','goals':['inspired']}}

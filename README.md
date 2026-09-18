@@ -326,7 +326,10 @@ The threaded workers allow Supabase, OpenAI, Gemini, and signed-URL requests to 
 Andrea provides free advice/outfit chat, a one-time welcome, and three successful
 photo ratings per account before Pro. Conversations are client-held and resettable;
 source photos are never stored. The existing outfit builder supplies catalog looks.
-Legacy routes and existing image generation remain unchanged.
+Legacy routes and existing image generation remain unchanged. Photo ratings use
+only an explicit per-photo occasion for dress code; saved quiz occasion, setting,
+weather, season, and budget are excluded from assessment context. Rubric v1.1
+retains optional style/goals preferences without requiring a saved persona.
 
 - `POST /andrea/chat`: JSON message/history/profile plus optional outfit/rating context.
   Guest text is supported; invalid supplied auth is rejected. Returns advice or an
