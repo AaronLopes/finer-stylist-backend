@@ -367,8 +367,15 @@ Small counter/idempotency records remain until account deletion. There is no cha
    ongoing entitlements. Native StoreKit status is still local to Superwall unless
    mirrored or the optional live Superwall fallback below is configured. Historical
    paid checkout records do not prove an active subscription.
-4. Set `ANDREA_RATINGS_ENABLED=true` on Render only for a configured test/release
-   environment. It defaults false. This switch does not affect free chat.
+4. Public rollout stays disabled (`ANDREA_RATINGS_ENABLED=false` by default).
+   The approved private preview in `andrea_rollout.py` contains one owner account
+   UUID. Both state and rating submission check the verified JWT user ID against
+   this server-owned list; request-body emails, IDs, and Pro claims cannot enroll
+   an account. Preview access does not grant Pro or bypass normal quotas.
+   `ANDREA_RATINGS_PREVIEW_USER_IDS` can replace the list with comma-separated
+   UUIDs; an explicit empty value disables previews. Malformed lists fail closed.
+   After subscription synchronization and quality QA, set
+   `ANDREA_RATINGS_ENABLED=true` to enable the public rollout. Free chat is unchanged.
 5. Test free/Pro, purchase/restore, expiration/refunds, and real outfit-photo quality
    before releasing the new iOS client. Do not infer rating quality from mock tests.
 
@@ -386,7 +393,7 @@ and token counts, never full conversations or image payloads.
 Validation:
 
 ```bash
-python -m pytest tests/test_andrea.py tests/test_andrea_entitlements.py -q
+python -m pytest tests/test_andrea.py tests/test_andrea_entitlements.py tests/test_andrea_rollout.py -q
 # Optional local PostgreSQL/WASM checks, no production credentials:
 cd tests
 pnpm install --frozen-lockfile

@@ -226,3 +226,49 @@ def test_date_reply_returns_card_payload_and_refinement_actions(setup):
     assert builds==[('Build an outfit for date.',)]
     assert len(r.json['actions'])==3
     assert all(action['id']=='message' and 'same occasion' in action['message'] for action in r.json['actions'])
+
+
+@pytest.mark.parametrize('global_enabled', ['false', 'true'])
+def test_rollout_state_and_upload_agree_for_verified_user(setup, monkeypatch, global_enabled):
+    c,s,a,e,_=setup
+    monkeypatch.setenv('ANDREA_RATINGS_ENABLED',global_enabled)
+    monkeypatch.setenv('ANDREA_RATINGS_PREVIEW_USER_IDS',UID.upper())
+    e.pro=True
+    state=c.get('/andrea/state',headers={'Authorization':'Bearer valid'}).json['state']
+    assert state['ratings_enabled'] and state['pro_status']=='active'
+    assert rate(c).status_code==200 and a.calls==1 and s.used==0
+
+
+def test_non_preview_account_cannot_enable_ratings_with_body_claims(setup,monkeypatch):
+    c,s,a,e,_=setup
+    from andrea_rollout import DEFAULT_RATING_PREVIEW_USER_IDS
+    preview_id=next(iter(DEFAULT_RATING_PREVIEW_USER_IDS))
+    monkeypatch.setenv('ANDREA_RATINGS_ENABLED','false')
+    monkeypatch.delenv('ANDREA_RATINGS_PREVIEW_USER_IDS',raising=False)
+    assert UID!=preview_id
+    e.pro=True
+    state=c.get('/andrea/state',headers={'Authorization':'Bearer valid'}).json['state']
+    assert not state['ratings_enabled']
+    result=rate(c,user_id=preview_id,email='aaronlopes@me.com',hasProAccess='true',ratings_enabled='true')
+    assert result.status_code==503 and result.json['code']=='ratings_unavailable'
+    assert a.calls==0 and not s.rows
+
+
+def test_preview_does_not_grant_pro_or_skip_lifetime_quota(setup,monkeypatch):
+    c,s,a,e,_=setup
+    monkeypatch.setenv('ANDREA_RATINGS_ENABLED','false')
+    monkeypatch.setenv('ANDREA_RATINGS_PREVIEW_USER_IDS',UID)
+    for _ in range(3):assert rate(c).status_code==200
+    assert rate(c).status_code==402 and s.used==3 and a.calls==3
+
+
+def test_preview_can_be_disabled_and_still_recover_existing_results(setup,monkeypatch):
+    c,s,a,e,_=setup
+    monkeypatch.setenv('ANDREA_RATINGS_ENABLED','false')
+    monkeypatch.setenv('ANDREA_RATINGS_PREVIEW_USER_IDS',UID)
+    rid=str(uuid4());assert rate(c,rid).status_code==200
+    monkeypatch.setenv('ANDREA_RATINGS_PREVIEW_USER_IDS','')
+    assert rate(c).status_code==503
+    recovered=c.get('/andrea/ratings/'+rid,headers={'Authorization':'Bearer valid'})
+    assert recovered.status_code==200 and recovered.json['rating']['score']==8
+    assert not recovered.json['state']['ratings_enabled'] and a.calls==1

@@ -10,8 +10,9 @@ class SupabaseEntitlements:
     """Read the existing billing-owned table using the authenticated Supabase UID.
 
     Subscription writers must maintain is_pro and expires_at. A missing row is
-    free, not a grant based on email or a historical Stripe checkout. Keep ratings
-    disabled until the Stripe/StoreKit sync and table write policies are verified.
+    free, not a grant based on email or a historical Stripe checkout. Keep public
+    rollout disabled until Stripe/StoreKit sync is verified; a server-owned preview
+    list can enable selected accounts without changing their entitlement.
     """
     def __init__(self, client_provider, fallback=None, now=None):
         self.client_provider = client_provider

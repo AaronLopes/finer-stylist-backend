@@ -13,6 +13,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 from andrea_service import AndreaService, short_text
 from andrea_entitlements import SupabaseEntitlements, EntitlementLookupError
+from andrea_rollout import ratings_rollout_allows
 
 logger = logging.getLogger(__name__)
 MAX_PHOTO_BYTES = 6 * 1024 * 1024
@@ -117,16 +118,16 @@ def register_andrea_routes(app, builder_provider, supabase_provider, *, service_
         try: return str(UUID(value))
         except (ValueError,TypeError,AttributeError) as exc:
             raise AndreaError('invalid_request','Missing or invalid request ID.',400) from exc
-    def ratings_enabled():
-        return os.getenv('ANDREA_RATINGS_ENABLED','false').lower()=='true' and entitlement.available()
+    def ratings_enabled(uid):
+        return ratings_rollout_allows(uid) and entitlement.available()
     def access_state(uid,read=False):
         state=store().state(uid,read)
         pro=None
-        if ratings_enabled():
+        if ratings_enabled(uid):
             try: pro=entitlement.is_pro(uid)
             except (AndreaError, EntitlementLookupError): pass
         return {**state,'pro_status':'active' if pro else ('inactive' if pro is False else 'unavailable'),
-                'ratings_enabled':ratings_enabled() and pro is not None}
+                'ratings_enabled':ratings_enabled(uid) and pro is not None}
     def budget(kind,uid):
         s=store()
         subject=uid or hashlib.sha256((request.remote_addr or 'unknown').encode()).hexdigest()
@@ -216,7 +217,7 @@ def register_andrea_routes(app, builder_provider, supabase_provider, *, service_
     @bp.post('/ratings')
     def rating():
         uid=identity()
-        if not ratings_enabled(): raise AndreaError('ratings_unavailable','Photo ratings are not available yet. You can still chat with Andrea.')
+        if not ratings_enabled(uid): raise AndreaError('ratings_unavailable','Photo ratings are not available yet. You can still chat with Andrea.')
         rid=request_id(request.form.get('request_id'))
         photo=request.files.get('image')
         if photo is None or photo.mimetype not in ('image/jpeg','image/png','image/webp'):
