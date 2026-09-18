@@ -1,0 +1,7 @@
+{
+  "name": "finer-andrea-database-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {"test": "node test_andrea_database.mjs && node test_entitlement_access.mjs"},
+  "devDependencies": {"@electric-sql/pglite": "0.5.8"}
+}

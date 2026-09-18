@@ -1880,6 +1880,10 @@ def push_broadcast():
     )
 
 
+from andrea_routes import register_andrea_routes
+register_andrea_routes(app, get_outfit_builder, get_supabase_client)
+
+
 # =============================================================================
 # MAIN
 # =============================================================================

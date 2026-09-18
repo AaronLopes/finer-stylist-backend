@@ -4,3 +4,4 @@ __pycache__
 migrations/.claude/
 Claude.md
 .claude/
+node_modules/

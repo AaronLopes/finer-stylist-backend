@@ -65,12 +65,12 @@ def test_list_fits_skips_failed_signed_urls(monkeypatch):
     service = FitImageService.__new__(FitImageService)
     service.supabase = _Supabase()
 
-    def fake_signed_url(path):
-        if path.endswith("2.png"):
-            raise TimeoutError("signed URL timeout")
-        return f"https://signed.example/{path}"
+    def fake_signed_urls(paths):
+        assert paths == ["user_1/fit_1/1.png", "user_1/fit_1/2.png"]
+        # The current service signs in one batch and omits failed paths.
+        return {paths[0]: f"https://signed.example/{paths[0]}"}
 
-    monkeypatch.setattr(service, "_create_signed_url", fake_signed_url)
+    monkeypatch.setattr(service, "_create_signed_urls_batch", fake_signed_urls)
 
     fits = service.list_fits("user_1")
 

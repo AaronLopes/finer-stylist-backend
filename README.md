@@ -18,6 +18,9 @@ Flask API for Finer's iOS styling experience. It builds outfits from quiz answer
 ```text
 api_server.py
   ├── outfit_builder.py         quiz/chat/Today params, category guidance, catalog RPC fallback
+  ├── andrea_routes.py         authenticated chat/rating endpoints, leases and budgets
+  ├── andrea_service.py        shared styling voice, text routing and photo assessment
+  ├── andrea_entitlements.py   existing Supabase account grants + optional native fallback
   ├── chat_service.py           stylist replies and follow-up intent resolution
   ├── product_search_service.py hybrid semantic + structured catalog search
   ├── material_scan_service.py  Gemini material-family analysis with confidence gating
@@ -317,3 +320,74 @@ The threaded workers allow Supabase, OpenAI, Gemini, and signed-URL requests to 
 - **June 28, 2026:** added category-guided outfit construction and safer fit-listing timeout behavior.
 - **June 16, 2026:** added optional `selfie_url` likeness references for generated fit images.
 - **June 15, 2026:** added semantic product search and made Omega the default catalog source with Chi fallback.
+
+## Andrea (new iOS client)
+
+Andrea provides free advice/outfit chat, a one-time welcome, and three successful
+photo ratings per account before Pro. Conversations are client-held and resettable;
+source photos are never stored. The existing outfit builder supplies catalog looks.
+Legacy routes and existing image generation remain unchanged.
+
+- `POST /andrea/chat`: JSON message/history/profile plus optional outfit/rating context.
+  Guest text is supported; invalid supplied auth is rejected. Returns advice or an
+  outfit with assistant copy and typed actions.
+- `GET /andrea/state`, `POST /andrea/welcome/read`: authenticated account allowance,
+  welcome-read status, trusted Pro status, and rating availability.
+- `POST /andrea/ratings`: authenticated multipart UUID `request_id`, `image`
+  (JPEG/PNG/WebP, max 6 MB), optional `occasion` and JSON `profile`. Normalizes to
+  at most 1280px and strips EXIF before one bounded vision call.
+- `GET /andrea/ratings/<request_id>` recovers an owned result; `POST /andrea/reset`
+  clears temporary recovery content without changing lifetime usage.
+
+All account endpoints validate Supabase JWTs server-side. The SQL RPCs serialize
+rating reservations, enforce three free completions, release failures/retakes,
+limit one in-flight analysis per account, and compare lease tokens before committing.
+Stable IDs avoid duplicate charges, reject changed payloads, and allow at most three
+attempts. Recovery expires after one hour; state reads clear expired payloads.
+Small counter/idempotency records remain until account deletion. There is no chat archive.
+
+### Setup and release gate
+
+1. Apply `migrations/013_entitlement_access.sql` and `migrations/012_andrea.sql`
+   in the existing Supabase SQL Editor. Both are repeatable. Migration 013 repairs
+   a public ALL entitlement policy; billing writes stay service-only and iOS may
+   read its own grant. Migration 012 adds service-only usage and budget RPCs.
+2. Pro reads the existing `entitlements` row by verified account ID (`is_pro=true`,
+   `expires_at` future or null for permanent). Sources already supported by this
+   schema are stripe/apple/google/promo; it has one row per user. Administrative
+   permanent grants use promo with no expiry. A request's email or Pro boolean
+   is never trusted. Expired/absent grants are free; lookup failure returns 503.
+3. Verify subscription synchronization before enabling ratings. The checked-in web
+   checkout writes `finer_web_purchases` and a short-lived paid-render cookie, not
+   ongoing entitlements. Native StoreKit status is still local to Superwall unless
+   mirrored or the optional live Superwall fallback below is configured. Historical
+   paid checkout records do not prove an active subscription.
+4. Set `ANDREA_RATINGS_ENABLED=true` on Render only for a configured test/release
+   environment. It defaults false. This switch does not affect free chat.
+5. Test free/Pro, purchase/restore, expiration/refunds, and real outfit-photo quality
+   before releasing the new iOS client. Do not infer rating quality from mock tests.
+
+Optional native fallback: `SUPERWALL_SERVER_API_KEY`, `SUPERWALL_APPLICATION_ID`,
+`SUPERWALL_PRO_ENTITLEMENT` use the documented v2 active-entitlements API with the
+same uppercase Supabase UUID already identified by iOS. An active Supabase grant
+wins; otherwise a configured native lookup is checked. Provider failures are 503.
+
+`ANDREA_CHAT_MODEL` defaults gpt-4o-mini; `ANDREA_RATING_MODEL` defaults gpt-4.1-mini.
+`ANDREA_CHAT_DAILY_LIMIT` defaults 5000 and `ANDREA_RATING_DAILY_LIMIT` defaults 500
+(global UTC-day request budgets); per-minute request limits and bounded prompt/image
+sizes also apply. These are request caps, not exact dollar caps. Logs contain model
+and token counts, never full conversations or image payloads.
+
+Validation:
+
+```bash
+python -m pytest tests/test_andrea.py tests/test_andrea_entitlements.py -q
+# Optional local PostgreSQL/WASM checks, no production credentials:
+cd tests
+pnpm install --frozen-lockfile
+pnpm test
+```
+
+The DB tests cover retries, leases, allowance, service-only RPCs, owner read isolation,
+blocked client writes, and deletion cascades. Live generic text checks also exercised
+the configured model. Real photo quality checks remain a release gate.
